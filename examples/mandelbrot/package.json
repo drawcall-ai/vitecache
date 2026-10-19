@@ -1,0 +1,21 @@
+{
+  "name": "@drawcall/vitecache-example-mandelbrot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "precompute": "tsx src/precompute.ts",
+    "build": "pnpm precompute && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@drawcall/vitecache": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0"
+  }
+}
