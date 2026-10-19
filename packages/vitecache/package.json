@@ -4,6 +4,23 @@
   "description": "Persistent binary caching for expensive computation in browsers and Node.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drawcall-ai/vitecache.git",
+    "directory": "packages/vitecache"
+  },
+  "bugs": {
+    "url": "https://github.com/drawcall-ai/vitecache/issues"
+  },
+  "homepage": "https://github.com/drawcall-ai/vitecache#readme",
+  "keywords": [
+    "vite",
+    "cache",
+    "precompute",
+    "browser",
+    "node",
+    "typescript"
+  ],
   "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -30,7 +47,7 @@
   },
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
-    "prepack": "pnpm build && pnpm test",
+    "prepack": "pnpm build && pnpm typecheck && pnpm test",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit"
   },
