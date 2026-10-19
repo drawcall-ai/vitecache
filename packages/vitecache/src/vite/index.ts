@@ -4,7 +4,7 @@ import type { Plugin, ResolvedConfig, ViteDevServer } from 'vite';
 import * as disk from '../disk.js';
 import { ChangedDependenciesError, createStorage } from '../storage.js';
 import type { Backend } from '../types.js';
-import { dependencies, hashes, paths } from '../dependencies.js';
+import { dependencies, hashes, resolvedDependencies } from '../dependencies.js';
 import { confine, inside, OutsideRootError, resolveDependencies } from './resolve.js';
 import { assetUrl, publicPaths } from './manifest.js';
 
@@ -98,18 +98,18 @@ async function respond(
   if ((name === '__vitecache/snapshot' || name === '__vitecache/resolve') && request.method === 'POST') {
     if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
     const value = parse(new TextDecoder().decode(await body(request)));
-    if (typeof value !== 'object' || value === null || !('fileDependencies' in value)) {
-      throw new RequestError(400, 'Expected fileDependencies');
+    if (typeof value !== 'object' || value === null || !('dependencies' in value)) {
+      throw new RequestError(400, 'Expected dependencies');
     }
     if (name === '__vitecache/resolve') {
-      const files = validate(value.fileDependencies, dependencies);
+      const deps = validate(value.dependencies, dependencies);
       const origin = `${server.config.server.https ? 'https' : 'http'}://${request.headers.host}`;
-      json(response, { paths: await resolveDependencies(server, files, origin) });
+      json(response, { dependencies: await resolveDependencies(server, deps, origin) });
       return;
     }
-    const files = validate(value.fileDependencies, paths);
-    await confine(root, files);
-    json(response, { hashes: await storage.snapshot(files) });
+    const deps = validate(value.dependencies, resolvedDependencies);
+    await confine(root, deps);
+    json(response, { hashes: await storage.snapshot(deps) });
     return;
   }
   if (!/^[a-f0-9]{64}\.bin$/.test(name)) {
@@ -120,10 +120,10 @@ async function respond(
   const key = name.slice(0, -4);
   if (request.method === 'PUT') {
     if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
-    const files = validate(header(request, 'x-vitecache-dependencies'), paths);
+    const deps = validate(header(request, 'x-vitecache-dependencies'), resolvedDependencies);
     const expected = validate(header(request, 'x-vitecache-hashes'), hashes);
-    await confine(root, files);
-    await storage.save(key, await body(request), files, expected);
+    await confine(root, deps);
+    await storage.save(key, await body(request), deps, expected);
     response.statusCode = 204;
     response.end();
     return;

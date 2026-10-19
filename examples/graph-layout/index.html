@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lazy graph layout · vitecache</title>
+    <style>
+      :root { font: 16px/1.6 system-ui, sans-serif; color: #e3ede8; background: #101a1b; color-scheme: dark; }
+      body { max-width: 960px; margin: auto; padding: 28px 20px; }
+      h1 { font-size: 2rem; line-height: 1.2; }
+      p { max-width: 75ch; color: #b4c7bf; }
+      figure { margin: 32px 0; overflow-x: auto; }
+      svg { display: block; width: 100%; min-width: 700px; height: auto; }
+      text { fill: #e3ede8; stroke: none; font: 14px system-ui, sans-serif; }
+      output { display: block; margin: 24px 0; }
+      a { color: #a4dbc2; }
+      :focus-visible { outline: 2px solid #e3ede8; outline-offset: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Skip the computation. Skip its code.</h1>
+    <p>ELK lays out this graph once. A cache hit loads the resulting SVG without importing the graph-layout engine.</p>
+    <figure aria-label="Generated build pipeline diagram"></figure>
+    <output role="status" aria-live="polite">Checking the cache…</output>
+    <p><a href="">Reload page</a> and inspect the Network panel: the layout module and ELK are requested only on a cache miss.</p>
+    <p><code>pnpm precompute</code> generates the SVG from Node. The build does this automatically, so production visitors never need to download the layout engine.</p>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

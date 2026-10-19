@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -21,7 +21,7 @@ test('a dependency change while staging bytes does not publish the rejected resu
   const root = await project();
   const source = join(root, 'source');
   await writeFile(source, 'before');
-  const entry = new CacheEntry({ root, version: 'race@1', fileDependencies: { source: { path: 'source' } } });
+  const entry = new CacheEntry({ root, version: 'race@1', dependencies: { source: { path: 'source' } } });
   await entry.load();
   await entry.save(new Uint8Array([1]));
   await entry.load();
@@ -42,7 +42,7 @@ test('repeated validity checks cannot replace a computation baseline', async () 
   const root = await project();
   const source = join(root, 'source');
   await writeFile(source, 'before');
-  const entry = new CacheEntry({ root, version: 'baseline@1', fileDependencies: { source: { path: 'source' } } });
+  const entry = new CacheEntry({ root, version: 'baseline@1', dependencies: { source: { path: 'source' } } });
   expect(await entry.load()).toBeUndefined();
   await writeFile(source, 'after');
   expect(await entry.has()).toBe(false);
@@ -56,7 +56,7 @@ test('a hit does not freeze the baseline for a later computation on a miss', asy
   const root = await project();
   const source = join(root, 'source');
   await writeFile(source, 'before');
-  const entry = new CacheEntry({ root, version: 'recompute@1', fileDependencies: { source: { path: 'source' } } });
+  const entry = new CacheEntry({ root, version: 'recompute@1', dependencies: { source: { path: 'source' } } });
   await entry.load();
   await entry.save(new Uint8Array([1]));
   expect(await entry.load()).toEqual(Buffer.from([1]));
@@ -69,13 +69,13 @@ test('a hit does not freeze the baseline for a later computation on a miss', asy
 test('persists binary values and metadata and appends one ignore entry', async () => {
   const root = await project();
   await writeFile(join(root, '.gitignore'), 'node_modules');
-  const entry = new CacheEntry({ root, version: 'persist@1', inputs: { model: '模型' } });
+  const entry = new CacheEntry({ root, version: 'persist@1', dependencies: { model: { value: '模型' } } });
   expect(await entry.has()).toBe(false);
   const bytes = new Uint8Array([0, 255, 128]);
   const saving = entry.save(bytes);
   bytes.fill(42);
   await saving;
-  expect(await new CacheEntry({ root, version: 'persist@1', inputs: { model: '模型' } }).load()).toEqual(Buffer.from([0, 255, 128]));
+  expect(await new CacheEntry({ root, version: 'persist@1', dependencies: { model: { value: '模型' } } }).load()).toEqual(Buffer.from([0, 255, 128]));
   await entry.save(new Uint8Array());
   expect(await entry.has()).toBe(true);
   expect(await entry.load()).toEqual(Buffer.from([]));
@@ -87,7 +87,7 @@ test('validates named dependencies by content and rejects changes during computa
   const root = await project();
   const source = join(root, 'model.bin');
   await writeFile(source, 'first');
-  const options = { root, version: 'transform@1', fileDependencies: { model: { path: 'model.bin' } } };
+  const options = { root, version: 'transform@1', dependencies: { model: { path: 'model.bin' } } };
   const entry = new CacheEntry(options);
   await expect(entry.save(new Uint8Array([1]))).rejects.toThrow();
   expect(await entry.load()).toBeUndefined();
@@ -138,15 +138,15 @@ test('local file URLs resolve to the same dependency as project-relative paths',
   const root = await project();
   const source = join(root, 'source');
   await writeFile(source, 'source bytes');
-  const entry = new CacheEntry({ root, version: 'url@1', fileDependencies: { source: { url: pathToFileURL(source).href } } });
+  const entry = new CacheEntry({ root, version: 'url@1', dependencies: { source: { url: pathToFileURL(source).href } } });
   await entry.load();
   await entry.save(new Uint8Array([1]));
-  const fromPath = new CacheEntry({ root, version: 'url@1', fileDependencies: { source: { path: 'source' } } });
+  const fromPath = new CacheEntry({ root, version: 'url@1', dependencies: { source: { path: 'source' } } });
   expect(await fromPath.load()).toEqual(Buffer.from([1]));
-  await expect(new CacheEntry({ root, version: 'url@1', fileDependencies: { source: { url: 'https://localhost/source' } } }).load()).rejects.toThrow(/project-root-relative path/);
+  await expect(new CacheEntry({ root, version: 'url@1', dependencies: { source: { url: 'https://localhost/source' } } }).load()).rejects.toThrow(/project-root-relative path/);
   const outside = join(await project(), 'source');
   await writeFile(outside, 'outside');
-  await expect(new CacheEntry({ root, version: 'url@1', fileDependencies: { source: { url: pathToFileURL(outside).href } } }).load()).rejects.toThrow(/project root/);
+  await expect(new CacheEntry({ root, version: 'url@1', dependencies: { source: { url: pathToFileURL(outside).href } } }).load()).rejects.toThrow(/project root/);
 });
 
 
@@ -158,12 +158,73 @@ test('file URLs resolve through a symlinked project root without rewriting decla
   const linkedRoot = join(await project(), 'project');
   await symlink(root, linkedRoot, 'dir');
   const options = { root: linkedRoot, version: 'symlink@1' };
-  const entry = new CacheEntry({ ...options, fileDependencies: { source: { url: pathToFileURL(await realpath(source)).href } } });
+  const entry = new CacheEntry({ ...options, dependencies: { source: { url: pathToFileURL(await realpath(source)).href } } });
   await entry.load();
   await entry.save(new Uint8Array([1]));
-  expect(await new CacheEntry({ ...options, fileDependencies: { source: { path: 'source' } } }).load()).toEqual(Buffer.from([1]));
-  const link = new CacheEntry({ ...options, fileDependencies: { source: { url: pathToFileURL(join(linkedRoot, 'source-link')).href } } });
+  expect(await new CacheEntry({ ...options, dependencies: { source: { path: 'source' } } }).load()).toEqual(Buffer.from([1]));
+  const link = new CacheEntry({ ...options, dependencies: { source: { url: pathToFileURL(join(linkedRoot, 'source-link')).href } } });
   await link.load();
   await link.save(new Uint8Array([2]));
-  expect(await new CacheEntry({ ...options, fileDependencies: { source: { path: 'source-link' } } }).load()).toEqual(Buffer.from([2]));
+  expect(await new CacheEntry({ ...options, dependencies: { source: { path: 'source-link' } } }).load()).toEqual(Buffer.from([2]));
+});
+
+async function installedPackage(root: string, name: string, version: string): Promise<string> {
+  const directory = join(root, 'node_modules', name);
+  await mkdir(directory, { recursive: true });
+  const manifest = join(directory, 'package.json');
+  await writeFile(manifest, JSON.stringify({ name, version, type: 'module', exports: { import: './index.js' } }));
+  await writeFile(join(directory, 'index.js'), 'throw new Error("Must not execute the dependency");');
+  return manifest;
+}
+
+test('package versions invalidate results and cannot replace a computation baseline', async () => {
+  const root = await project();
+  const manifest = await installedPackage(root, '@example/layout', '1.0.0');
+  const options = { root, version: 'layout@1', dependencies: { engine: { package: '@example/layout' }, graph: { value: [1, 2] } } };
+  const entry = new CacheEntry(options);
+  await expect(entry.save(new Uint8Array([1]))).rejects.toThrow();
+  expect(await entry.load()).toBeUndefined();
+  await entry.save(new Uint8Array([1]));
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from([1]));
+  await writeFile(manifest, JSON.stringify({ version: '2.0.0' }));
+  expect(await entry.load()).toBeUndefined();
+  await writeFile(manifest, JSON.stringify({ version: '3.0.0' }));
+  expect(await entry.has()).toBe(false);
+  await expect(entry.save(new Uint8Array([2]))).rejects.toThrow(/changed/);
+  expect(await entry.load()).toBeUndefined();
+  await entry.save(new Uint8Array([3]));
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from([3]));
+  expect(await readdir(join(root, 'public/_vitecache'))).toHaveLength(2);
+  await unlink(manifest);
+  expect(await entry.load()).toBeUndefined();
+  await expect(entry.save(new Uint8Array([4]))).rejects.toThrow();
+});
+
+test('package location and declaration order do not affect keys, and values need no baseline', async () => {
+  const root = await project();
+  const packageRoot = await project();
+  await installedPackage(packageRoot, 'layout', '1.0.0');
+  await mkdir(join(root, 'node_modules'));
+  await symlink(join(packageRoot, 'node_modules/layout'), join(root, 'node_modules/layout'), 'dir');
+  const first = new CacheEntry({ root, version: 'portable@1', dependencies: { graph: { value: { b: 2, a: 1 } }, engine: { package: 'layout' } } });
+  await first.load();
+  await first.save(new Uint8Array([1]));
+  await unlink(join(root, 'node_modules/layout'));
+  await installedPackage(root, 'layout', '1.0.0');
+  const second = new CacheEntry({ root, version: 'portable@1', dependencies: { engine: { package: 'layout' }, graph: { value: { a: 1, b: 2 } } } });
+  expect(await second.load()).toEqual(Buffer.from([1]));
+  const value = new CacheEntry({ root, version: 'value@1', dependencies: { graph: { value: { nodes: [1] } } } });
+  await value.save(new Uint8Array([2]));
+  expect(await value.load()).toEqual(Buffer.from([2]));
+  expect(await new CacheEntry({ root, version: 'value@1', dependencies: { graph: { value: { nodes: [2] } } } }).load()).toBeUndefined();
+});
+
+test('malformed package manifests remain visible rather than becoming cache misses', async () => {
+  const root = await project();
+  const manifest = await installedPackage(root, 'layout', '1.0.0');
+  const entry = new CacheEntry({ root, version: 'layout@1', dependencies: { engine: { package: 'layout' } } });
+  await writeFile(manifest, '{');
+  await expect(entry.load()).rejects.toThrow(SyntaxError);
+  await writeFile(manifest, JSON.stringify({ version: 42 }));
+  await expect(entry.load()).rejects.toThrow(/version/);
 });

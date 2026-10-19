@@ -8,6 +8,7 @@ import { CacheEntry as BrowserEntry } from '../src/browser.js';
 import { CacheEntry as NodeEntry } from '../src/node.js';
 import { createStorage } from '../src/storage.js';
 import { digest } from '../src/key.js';
+import type { ResolvedDependencies } from '../src/types.js';
 import { vitecache } from '../src/vite/index.js';
 
 const servers: ViteDevServer[] = [];
@@ -38,12 +39,12 @@ async function start(custom = false): Promise<{ root: string; origin: string; ur
 }
 
 const key = digest(new TextEncoder().encode('result'));
-const files = { '算法': '算法.ts' };
+const files = { '算法': { path: '算法.ts' } };
 
-async function snapshot(url: string, fileDependencies: Record<string, string> = files): Promise<Response> {
+async function snapshot(url: string, dependencies: ResolvedDependencies = files): Promise<Response> {
   return fetch(`${url}__vitecache/snapshot`, {
     method: 'POST',
-    body: JSON.stringify({ fileDependencies }),
+    body: JSON.stringify({ dependencies }),
   });
 }
 
@@ -56,7 +57,7 @@ function headers(source: string): Record<string, string> {
 
 test.each([false, true])('persists dependency metadata and bytes with custom configuration %s', async (custom) => {
   const { root, origin, url } = await start(custom);
-  await writeFile(join(root, files['算法']), 'before');
+  await writeFile(join(root, files['算法'].path), 'before');
   expect(await (await fetch(`${url}__vitecache`)).json()).toEqual({ vitecache: 1 });
   expect(await (await snapshot(url)).json()).toEqual({ hashes: { '算法': digest(new TextEncoder().encode('before')) } });
   const file = `${url}${key}.bin`;
@@ -75,9 +76,9 @@ test.each([false, true])('persists dependency metadata and bytes with custom con
   const options = custom ? { root, basePath: 'assets/cache' } : { root };
   expect((await createStorage(options).load(key, true))?.bytes).toEqual(Buffer.from([0, 255]));
   expect(await readFile(join(root, '.gitignore'), 'utf8')).toBe(custom ? 'assets/cache/*\n' : 'public/_vitecache/*\n');
-  await writeFile(join(root, files['算法']), 'after');
+  await writeFile(join(root, files['算法'].path), 'after');
   expect((await fetch(file, { method: 'PUT', headers: headers('before'), body: 'stale' })).status).toBe(409);
-  expect(await (await snapshot(url, { absent: 'absent.ts' })).json()).toEqual({ hashes: null });
+  expect(await (await snapshot(url, { absent: { path: 'absent.ts' } })).json()).toEqual({ hashes: null });
 });
 
 test('rejects malformed protocol, foreign origins, and dependency paths outside the root', async () => {
@@ -86,14 +87,14 @@ test('rejects malformed protocol, foreign origins, and dependency paths outside 
   expect((await fetch(file, { method: 'PUT', headers: { Origin: 'https://attacker.example' }, body: 'bad' })).status).toBe(403);
   expect((await fetch(file, { method: 'PUT', body: 'bad' })).status).toBe(400);
   expect((await fetch(`${url}__vitecache/snapshot`, {
-    method: 'POST', headers: { Origin: 'https://attacker.example' }, body: JSON.stringify({ fileDependencies: {} }),
+    method: 'POST', headers: { Origin: 'https://attacker.example' }, body: JSON.stringify({ dependencies: {} }),
   })).status).toBe(403);
-  expect((await snapshot(url, { outside: '../outside' })).status).toBe(400);
+  expect((await snapshot(url, { outside: { path: '../outside' } })).status).toBe(400);
   const outside = await mkdtemp(join(tmpdir(), 'vitecache-outside-'));
   roots.push(outside);
   await writeFile(join(outside, 'secret'), 'private');
   await symlink(join(outside, 'secret'), join(root, 'linked'));
-  expect((await snapshot(url, { linked: 'linked' })).status).toBe(403);
+  expect((await snapshot(url, { linked: { path: 'linked' } })).status).toBe(403);
   expect((await fetch(`${url}unexpected.bin`, { method: 'PUT', body: 'bad' })).status).toBe(404);
   expect((await fetch(`${file}%2fsecret`)).status).toBe(404);
   expect((await fetch(file, { method: 'DELETE' })).status).toBe(405);
@@ -105,7 +106,10 @@ test('browser CacheEntry and Node CacheEntry share identity, validate, and persi
   vi.stubGlobal('location', { href: origin });
   const source = join(root, 'source.ts');
   await writeFile(source, 'first');
-  const options = { version: 'cross-runtime@1', inputs: { ratio: 0.5 }, fileDependencies: { source: { path: 'source.ts' } } };
+  await mkdir(join(root, 'node_modules/compute'), { recursive: true });
+  const manifest = join(root, 'node_modules/compute/package.json');
+  await writeFile(manifest, JSON.stringify({ name: 'compute', version: '1.0.0' }));
+  const options = { version: 'cross-runtime@1', dependencies: { ratio: { value: 0.5 }, source: { path: 'source.ts' }, library: { package: 'compute' } } };
   const browser = new BrowserEntry({ ...options, basePath: url });
   const node = new NodeEntry({ ...options, root });
   expect(await browser.load()).toBeUndefined();
@@ -115,6 +119,10 @@ test('browser CacheEntry and Node CacheEntry share identity, validate, and persi
   expect(await browser.load()).toBeUndefined();
   await browser.save(new Uint8Array([2]));
   expect(await new NodeEntry({ ...options, root }).load()).toEqual(Buffer.from([2]));
+  await writeFile(manifest, JSON.stringify({ name: 'compute', version: '2.0.0' }));
+  expect(await browser.load()).toBeUndefined();
+  await browser.save(new Uint8Array([3]));
+  expect(await new NodeEntry({ ...options, root }).load()).toEqual(Buffer.from([3]));
 });
 
 
@@ -124,8 +132,8 @@ test.each([false, true])('resolves served URLs to project paths with custom conf
   await mkdir(join(root, publicDir), { recursive: true });
   await writeFile(join(root, publicDir, 'chair.glb'), 'model');
   await writeFile(join(root, 'source.ts'), 'source');
-  const resolve = async (fileDependencies: unknown) => fetch(`${url}__vitecache/resolve`, {
-    method: 'POST', body: JSON.stringify({ fileDependencies }),
+  const resolve = async (dependencies: unknown) => fetch(`${url}__vitecache/resolve`, {
+    method: 'POST', body: JSON.stringify({ dependencies }),
   });
   const prefix = custom ? '/app' : '';
   expect(await (await resolve({
@@ -133,9 +141,11 @@ test.each([false, true])('resolves served URLs to project paths with custom conf
     source: { url: `${prefix}/source.ts?t=123` },
     filesystem: { url: `${prefix}/@fs/${root}/source.ts` },
     same: { path: 'source.ts' },
-  })).json()).toEqual({ paths: { model: `${publicDir}/chair.glb`, source: 'source.ts', filesystem: 'source.ts', same: 'source.ts' } });
+    settings: { value: { ratio: 0.5 } },
+    library: { package: 'compute' },
+  })).json()).toEqual({ dependencies: { model: { path: `${publicDir}/chair.glb` }, source: { path: 'source.ts' }, filesystem: { path: 'source.ts' }, same: { path: 'source.ts' }, settings: { value: { ratio: 0.5 } }, library: { package: 'compute' } } });
   const named = await resolve(Object.fromEntries([['__proto__', { url: `${prefix}/source.ts` }]]));
-  expect(await named.json()).toEqual({ paths: Object.fromEntries([['__proto__', 'source.ts']]) });
+  expect(await named.json()).toEqual({ dependencies: Object.fromEntries([['__proto__', { path: 'source.ts' }]]) });
   expect((await resolve({ model: { url: 'https://foreign.example/chair.glb' } })).status).toBe(400);
   expect((await resolve({ model: { url: `${prefix}/absent.glb` } })).status).toBe(400);
 });
@@ -151,6 +161,8 @@ test.each(['/app/', './'])('build preserves public and emitted URL mappings with
   await writeFile(join(root, 'src/main.js'), 'import model from "./chair.glb?url"; console.log(model)');
   await writeFile(join(root, 'src/chair.glb'), 'imported model');
   await writeFile(join(root, 'assets/public.glb'), 'public model');
+  await mkdir(join(root, 'node_modules/compute'), { recursive: true });
+  await writeFile(join(root, 'node_modules/compute/package.json'), JSON.stringify({ name: 'compute', version: '1.0.0' }));
   await build({ root, base, publicDir: 'assets', configFile: false, logLevel: 'silent',
     plugins: [vitecache({ basePath: `assets/${cachePath}` })], build: { assetsInlineLimit: 0 },
   });
@@ -169,12 +181,22 @@ test.each(['/app/', './'])('build preserves public and emitted URL mappings with
     if (!address || typeof address === 'string') throw new Error('Preview did not listen');
     const origin = `http://127.0.0.1:${address.port}`;
     vi.stubGlobal('location', { href: `${origin}${prefix}/` });
-    const node = new NodeEntry({ root, basePath: `dist/${cachePath}`, version: 'build@1', fileDependencies: { model: { path: 'src/chair.glb' } } });
+    const node = new NodeEntry({ root, basePath: `dist/${cachePath}`, version: 'build@1', dependencies: { model: { path: 'src/chair.glb' }, library: { package: 'compute' }, settings: { value: { ratio: 0.5 } } } });
     await node.load();
     await node.save(new Uint8Array([42]));
-    const browser = new BrowserEntry({ basePath: `${origin}${prefix}/${cachePath}/`, version: 'build@1', fileDependencies: { model: { url: `${prefix}/${emitted[0]}` } } });
+    const browser = new BrowserEntry({ basePath: `${origin}${prefix}/${cachePath}/`, version: 'build@1', dependencies: { model: { url: `${prefix}/${emitted[0]}` }, library: { package: 'compute' }, settings: { value: { ratio: 0.5 } } } });
     expect(await browser.load()).toEqual(new Uint8Array([42]));
   } finally {
     await new Promise<void>((resolve, reject) => server.httpServer.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+
+test('large JSON values affect the key without entering validation headers', async () => {
+  const { root, origin, url } = await start();
+  vi.stubGlobal('location', { href: origin });
+  const options = { version: 'large-value@1', dependencies: { content: { value: 'x'.repeat(64_000) } } };
+  await new BrowserEntry({ ...options, basePath: url }).save(new Uint8Array([7]));
+  expect(await new NodeEntry({ ...options, root }).load()).toEqual(Buffer.from([7]));
+  expect(await new NodeEntry({ ...options, root, dependencies: { content: { value: 'different' } } }).load()).toBeUndefined();
 });

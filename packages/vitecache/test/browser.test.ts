@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { CacheEntry } from '../src/browser.js';
-import { digest, identity, key } from '../src/key.js';
+import { digest, key } from '../src/key.js';
 
 function server(handler: (url: URL, init: RequestInit | undefined) => Response | Promise<Response>) {
   const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -29,7 +29,7 @@ afterEach(() => {
 test('production reads static bytes without dependency checks, warns on has misses, and skips saves', async () => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   const fetch = server((url) => url.pathname.endsWith('__vitecache') ? discovery(false) : binary([2, 3]));
-  const entry = new CacheEntry({ version: 'static@1', fileDependencies: { algorithm: { path: 'src/not-deployed.ts' } } });
+  const entry = new CacheEntry({ version: 'static@1', dependencies: { algorithm: { path: 'src/not-deployed.ts' }, engine: { package: 'not-installed-in-browser' }, parameters: { value: { ratio: 0.5 } } } });
   expect(await entry.load()).toEqual(new Uint8Array([2, 3]));
   expect(await entry.has()).toBe(true);
   expect(fetch.mock.calls.some(([url]) => url.toString().includes('snapshot'))).toBe(false);
@@ -49,18 +49,18 @@ test('plugin validates dependencies, ignores declaration mutation, and snapshots
   let current = original;
   let saved: Uint8Array | undefined;
   const files = { '模型': { path: 'public/模型.glb' } };
-  const entry = new CacheEntry({ version: 'mesh@1', fileDependencies: files, basePath: '/app/cache/' });
+  const entry = new CacheEntry({ version: 'mesh@1', dependencies: files, basePath: '/app/cache/' });
   files['模型'].path = 'changed-after-construction';
   const fetch = server((url, init) => {
     expect(url.pathname).toMatch(/^\/app\/cache\//);
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
     if (url.pathname.endsWith('snapshot')) {
-      expect(init?.body).toBe(JSON.stringify({ fileDependencies: { '模型': 'public/模型.glb' } }));
+      expect(init?.body).toBe(JSON.stringify({ dependencies: { '模型': { path: 'public/模型.glb' } } }));
       return Response.json({ hashes: { '模型': current } });
     }
     if (init?.method === 'PUT') {
       const headers = new Headers(init.headers);
-      expect(JSON.parse(decodeURIComponent(headers.get('X-Vitecache-Dependencies') ?? ''))).toEqual({ '模型': 'public/模型.glb' });
+      expect(JSON.parse(decodeURIComponent(headers.get('X-Vitecache-Dependencies') ?? ''))).toEqual({ '模型': { path: 'public/模型.glb' } });
       expect(JSON.parse(decodeURIComponent(headers.get('X-Vitecache-Hashes') ?? ''))).toEqual({ '模型': current });
       expect(init.body).toEqual(new Uint8Array([0, 255]));
       saved = new Uint8Array([0, 255]);
@@ -92,7 +92,7 @@ test('plugin misses and missing dependencies stay quiet, failures reject without
     if (url.pathname.endsWith('snapshot')) return Response.json({ hashes: null });
     throw new Error('Must not read cached data for missing dependencies');
   });
-  const missing = new CacheEntry({ version: 'missing-dep@1', fileDependencies: { source: { path: 'missing' } } });
+  const missing = new CacheEntry({ version: 'missing-dep@1', dependencies: { source: { path: 'missing' } } });
   expect(await missing.load()).toBeUndefined();
   await expect(missing.save(new Uint8Array())).rejects.toThrow(/missing/);
   server((url) => url.pathname.endsWith('__vitecache') ? discovery(true) : new Response(null, { status: 409 }));
@@ -110,29 +110,30 @@ test('production URL resolution uses build mappings and rejects absent or foreig
     if (url.pathname.endsWith('paths.json')) return Response.json({ root: '../../', paths: { 'assets/model-abc.glb': 'src/model.glb' } });
     return binary([7]);
   });
-  const fromUrl = new CacheEntry({ version: 'production@1', basePath: '/app/_vitecache/', fileDependencies: { model: { url: '/app/assets/model-abc.glb?v=1' } } });
+  const fromUrl = new CacheEntry({ version: 'production@1', basePath: '/app/_vitecache/', dependencies: { model: { url: '/app/assets/model-abc.glb?v=1' } } });
   expect(await fromUrl.load()).toEqual(new Uint8Array([7]));
-  await expect(new CacheEntry({ version: 'unmapped@1', fileDependencies: { model: { url: '/unknown.glb' } } }).load()).rejects.toThrow(/No vitecache source/);
-  await expect(new CacheEntry({ version: 'foreign@1', fileDependencies: { model: { url: 'https://foreign.test/a.glb' } } }).load()).rejects.toThrow(/same Vite project origin/);
+  await expect(new CacheEntry({ version: 'unmapped@1', dependencies: { model: { url: '/unknown.glb' } } }).load()).rejects.toThrow(/No vitecache source/);
+  await expect(new CacheEntry({ version: 'foreign@1', dependencies: { model: { url: 'https://foreign.test/a.glb' } } }).load()).rejects.toThrow(/same Vite project origin/);
   server((url) => url.pathname.endsWith('__vitecache') ? discovery(false) : new Response(null, { status: 404 }));
-  await expect(new CacheEntry({ version: 'no-map@1', fileDependencies: { model: { url: '/model.glb' } } }).load()).rejects.toThrow(/Missing production URL mapping/);
+  await expect(new CacheEntry({ version: 'no-map@1', dependencies: { model: { url: '/model.glb' } } }).load()).rejects.toThrow(/Missing production URL mapping/);
 });
 
 test('lazy resolution captures declarations and retries failed URL resolution', async () => {
-  const inputs = { ratio: 0.5 };
-  const options = { version: 'lazy@1', inputs, fileDependencies: { model: { url: '/model.glb' } } };
+  const values = { ratio: 0.5 };
+  const options = { version: 'lazy@1', dependencies: { model: { url: '/model.glb' }, parameters: { value: values } } };
   const entry = new CacheEntry(options);
-  inputs.ratio = 1;
-  options.fileDependencies.model.url = '/changed.glb';
+  values.ratio = 1;
+  options.dependencies.model.url = '/changed.glb';
   let attempts = 0;
   const fetch = server((url, init) => {
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
     if (url.pathname.endsWith('resolve')) {
-      expect(init?.body).toBe(JSON.stringify({ fileDependencies: { model: { url: 'https://example.test/model.glb' } } }));
+      expect(init?.body).toBe(JSON.stringify({ dependencies: { model: { url: 'https://example.test/model.glb' }, parameters: { value: { ratio: 0.5 } } } }));
       if (++attempts === 1) return new Response(null, { status: 500 });
-      return Response.json({ paths: { model: 'public/model.glb' } });
+      return Response.json({ dependencies: { model: { path: 'public/model.glb' }, parameters: { value: { ratio: 0.5 } } } });
     }
     if (url.pathname.endsWith('snapshot')) return Response.json({ hashes: { model: digest(new Uint8Array([1])) } });
+    expect(url.pathname).toContain(key('lazy@1', { model: { path: 'public/model.glb' }, parameters: { value: { ratio: 0.5 } } }));
     return binary([2], { model: digest(new Uint8Array([1])) });
   });
   expect(fetch).not.toHaveBeenCalled();
@@ -144,15 +145,14 @@ test('lazy resolution captures declarations and retries failed URL resolution', 
 
 
 test('relative-base production mappings resolve under a deployment prefix and nested cache directory', async () => {
-  const id = identity({ version: 'relocated@1' });
-  const expected = key(id, { model: 'src/model.glb' });
+  const expected = key('relocated@1', { model: { path: 'src/model.glb' } });
   server((url) => {
     if (url.pathname.endsWith('__vitecache')) return discovery(false);
     if (url.pathname.endsWith('paths.json')) return Response.json({ root: '../../../', paths: { 'assets/model-abc.glb': 'src/model.glb' } });
     expect(url.pathname).toBe(`/deployment/nested/cache/${expected}.bin`);
     return binary([8]);
   });
-  const entry = new CacheEntry({ version: 'relocated@1', basePath: '/deployment/nested/cache/', fileDependencies: { model: { url: '/deployment/assets/model-abc.glb' } } });
+  const entry = new CacheEntry({ version: 'relocated@1', basePath: '/deployment/nested/cache/', dependencies: { model: { url: '/deployment/assets/model-abc.glb' } } });
   expect(await entry.load()).toEqual(new Uint8Array([8]));
 });
 
@@ -162,10 +162,11 @@ test('browser saves without the plugin warn before dependency preparation or URL
   const fetch = server(() => discovery(false));
   const entries = [
     new CacheEntry({ version: 'no-dependencies@1' }),
-    new CacheEntry({ version: 'path@1', fileDependencies: { source: { path: 'src/source.ts' } } }),
-    new CacheEntry({ version: 'url@1', fileDependencies: { source: { url: '/source.ts' } } }),
+    new CacheEntry({ version: 'path@1', dependencies: { source: { path: 'src/source.ts' } } }),
+    new CacheEntry({ version: 'url@1', dependencies: { source: { url: '/source.ts' } } }),
+    new CacheEntry({ version: 'package@1', dependencies: { engine: { package: 'elkjs' } } }),
   ];
   for (const entry of entries) await expect(entry.save(new Uint8Array([1]))).resolves.toBeUndefined();
-  expect(warn).toHaveBeenCalledTimes(3);
+  expect(warn).toHaveBeenCalledTimes(4);
   expect(fetch.mock.calls.every(([url, init]) => url.toString().endsWith('__vitecache') && init?.method !== 'PUT')).toBe(true);
 });

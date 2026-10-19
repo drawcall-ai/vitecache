@@ -1,4 +1,4 @@
-import type { FileDependencies, FileDependency, Hashes, Paths } from './types.js';
+import type { Dependencies, Dependency, Hashes, JsonValue, Paths, ResolvedDependencies, ResolvedDependency } from './types.js';
 
 export function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -41,17 +41,51 @@ export function paths(value: unknown): Paths {
   })));
 }
 
-export function dependencies(value: unknown): FileDependencies {
-  const entries = Object.entries(record(value)).map(([name, value]): [string, FileDependency] => {
-    if (!name) throw new TypeError('File dependencies require nonempty names.');
-    const locator = record(value);
-    const keys = Object.keys(locator);
-    if (keys.length !== 1) throw new TypeError('Each file dependency must have exactly one path or url.');
-    if ('path' in locator) return [name, Object.freeze({ path: path(locator.path) })];
-    if ('url' in locator && typeof locator.url === 'string' && locator.url && !locator.url.includes('\0')) {
-      return [name, Object.freeze({ url: locator.url })];
+/** Validate and snapshot JSON before asynchronous dependency resolution starts. */
+export function json(value: unknown, ancestors = new Set<object>()): JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'object') throw new TypeError('Dependency values must contain only JSON values.');
+  if (ancestors.has(value)) throw new TypeError('Dependency values must not contain cycles.');
+  ancestors.add(value);
+  try {
+    if (!Array.isArray(value)) return Object.freeze(Object.fromEntries(Object.entries(record(value)).map(([name, item]) => [name, json(item, ancestors)])));
+    if (Object.getOwnPropertySymbols(value).length) throw new TypeError('Dependency values must not contain symbol properties.');
+    const items: JsonValue[] = [];
+    for (let index = 0; index < value.length; index++) {
+      const property = Object.getOwnPropertyDescriptor(value, index);
+      if (!property || !('value' in property)) throw new TypeError('Dependency values must not contain sparse arrays or getters.');
+      const item: unknown = property.value;
+      items.push(json(item, ancestors));
     }
-    throw new TypeError('Each file dependency must have a nonempty path or url.');
+    return Object.freeze(items);
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+export function dependencies(value: unknown): Dependencies {
+  const entries = Object.entries(record(value)).map(([name, value]): [string, Dependency] => {
+    if (!name) throw new TypeError('Dependencies require nonempty names.');
+    const source = record(value);
+    if (Object.keys(source).length !== 1) throw new TypeError('Each dependency must have exactly one value, path, url, or package.');
+    if (Object.hasOwn(source, 'value')) return [name, Object.freeze({ value: json(source.value) })];
+    if (Object.hasOwn(source, 'path')) return [name, Object.freeze({ path: path(source.path) })];
+    if (Object.hasOwn(source, 'url') && typeof source.url === 'string' && source.url && !source.url.includes('\0')) {
+      return [name, Object.freeze({ url: source.url })];
+    }
+    if (Object.hasOwn(source, 'package') && typeof source.package === 'string' && /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i.test(source.package)) {
+      return [name, Object.freeze({ package: source.package })];
+    }
+    throw new TypeError('Each dependency must have a JSON value, root-relative path, nonempty URL, or package name without a subpath.');
+  });
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+export function resolvedDependencies(value: unknown): ResolvedDependencies {
+  const entries = Object.entries(dependencies(value)).map(([name, dependency]): [string, ResolvedDependency] => {
+    if (dependency.url !== undefined) throw new TypeError('Expected resolved dependencies, not URLs.');
+    return [name, dependency];
   });
   return Object.freeze(Object.fromEntries(entries));
 }

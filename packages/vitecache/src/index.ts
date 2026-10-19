@@ -1,2 +1,2 @@
 export { CacheEntry } from './browser.js';
-export type { CacheEntryOptions, FileDependency, FileDependencies, JsonValue } from './types.js';
+export type { CacheEntryOptions, Dependency, Dependencies, JsonValue } from './types.js';

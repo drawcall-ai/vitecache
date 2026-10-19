@@ -1,7 +1,7 @@
-import { hashes, paths, record } from './dependencies.js';
+import { hashes, paths, record, resolvedDependencies } from './dependencies.js';
 import { Entry } from './entry.js';
-import type { Backend, CacheEntryOptions } from './types.js';
-export type { CacheEntryOptions, FileDependency, FileDependencies, JsonValue } from './types.js';
+import type { Backend, CacheEntryOptions, Dependency, ResolvedDependency } from './types.js';
+export type { CacheEntryOptions, Dependency, Dependencies, JsonValue } from './types.js';
 
 function createBackend(options: CacheEntryOptions): Backend {
   const base = new URL(`${(options.basePath ?? '/_vitecache/').replace(/\/+$/, '')}/`, globalThis.location.href);
@@ -27,26 +27,26 @@ function createBackend(options: CacheEntryOptions): Backend {
 
   return {
     canSave: plugin,
-    async resolve(files) {
-      const locators = Object.entries(files).map(([name, locator]) => {
-        if (locator.path !== undefined) return [name, { path: locator.path }] satisfies [string, { path: string } | { url: string }];
+    async resolve(dependencies) {
+      const locators = Object.entries(dependencies).map(([name, locator]): [string, Dependency] => {
+        if (locator.url === undefined) return [name, locator];
         const url = new URL(locator.url, globalThis.location.href);
         if (url.origin !== new URL(globalThis.location.href).origin) throw new Error('URL dependencies must be served by the same Vite project origin.');
-        return [name, { url: url.href }] satisfies [string, { path: string } | { url: string }];
+        return [name, { url: url.href }];
       });
-      if (locators.every(([, locator]) => 'path' in locator)) {
-        return paths(Object.fromEntries(locators.map(([name, locator]) => [name, 'path' in locator ? locator.path : undefined])));
+      if (locators.every(([, locator]) => locator.url === undefined)) {
+        return resolvedDependencies(Object.fromEntries(locators));
       }
       if (await plugin()) {
         const response = await fetch(new URL('__vitecache/resolve', base), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileDependencies: Object.fromEntries(locators) }),
+          body: JSON.stringify({ dependencies: Object.fromEntries(locators) }),
           cache: 'no-store',
         });
         if (!response.ok) throw new Error(`vitecache URL resolution failed: HTTP ${response.status}`);
         const data: unknown = await response.json();
-        const resolved = paths(record(data).paths);
+        const resolved = resolvedDependencies(record(data).dependencies);
         if (Object.keys(resolved).length !== locators.length || !locators.every(([name]) => Object.hasOwn(resolved, name))) {
           throw new Error('Invalid vitecache resolved dependencies.');
         }
@@ -63,21 +63,21 @@ function createBackend(options: CacheEntryOptions): Backend {
       if (typeof manifest.root !== 'string' || !/^(?:\.\.\/)+$/.test(manifest.root)) throw new Error('Invalid vitecache production mapping root.');
       const projectRoot = new URL(manifest.root, manifestUrl);
       const mapped = Object.fromEntries(Object.entries(mapping).map(([url, path]) => [new URL(url, projectRoot).pathname, path]));
-      const resolved = locators.map(([name, locator]) => {
-        if ('path' in locator) return [name, locator.path];
+      const resolved = locators.map(([name, locator]): [string, ResolvedDependency] => {
+        if (locator.url === undefined) return [name, locator];
         const pathname = new URL(locator.url).pathname;
         const path = mapped[pathname];
         if (path === undefined) throw new Error(`No vitecache source file mapping for URL: ${pathname}`);
-        return [name, path];
+        return [name, { path }];
       });
-      return paths(Object.fromEntries(resolved));
+      return resolvedDependencies(Object.fromEntries(resolved));
     },
-    async snapshot(files) {
+    async snapshot(dependencies) {
       if (!await plugin()) return undefined;
       const response = await fetch(new URL('__vitecache/snapshot', base), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileDependencies: files }),
+        body: JSON.stringify({ dependencies }),
         cache: 'no-store',
       });
       if (!response.ok) throw new Error(`vitecache dependency validation failed: HTTP ${response.status}`);
@@ -101,12 +101,12 @@ function createBackend(options: CacheEntryOptions): Backend {
       const value: unknown = JSON.parse(decodeURIComponent(header));
       return { bytes, hashes: hashes(value) };
     },
-    async save(key, value, files, expected) {
+    async save(key, value, dependencies, expected) {
       const response = await fetch(new URL(`${key}.bin`, base), {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/octet-stream',
-          'X-Vitecache-Dependencies': encodeURIComponent(JSON.stringify(files)),
+          'X-Vitecache-Dependencies': encodeURIComponent(JSON.stringify(dependencies)),
           'X-Vitecache-Hashes': encodeURIComponent(JSON.stringify(expected)),
         },
         body: new Uint8Array(value),

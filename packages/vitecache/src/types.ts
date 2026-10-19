@@ -1,16 +1,22 @@
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-export type FileDependency = { readonly path: string; readonly url?: never } | { readonly url: string; readonly path?: never };
-export type FileDependencies = Readonly<Record<string, FileDependency>>;
+
+/** Exactly one source per dependency. Names and descriptors participate in cache identity. */
+export type Dependency =
+  | { readonly value: JsonValue; readonly path?: never; readonly url?: never; readonly package?: never }
+  | { readonly path: string; readonly value?: never; readonly url?: never; readonly package?: never }
+  | { readonly url: string; readonly value?: never; readonly path?: never; readonly package?: never }
+  | { readonly package: string; readonly value?: never; readonly path?: never; readonly url?: never };
+export type Dependencies = Readonly<Record<string, Dependency>>;
+export type ResolvedDependency = Exclude<Dependency, { readonly url: string }>;
+export type ResolvedDependencies = Readonly<Record<string, ResolvedDependency>>;
 export type Paths = Readonly<Record<string, string>>;
 export type Hashes = Readonly<Record<string, string>>;
 
 export interface CacheEntryOptions {
   /** Identifies the computation and its implementation version, for example "simplify@2". */
   version: string;
-  /** JSON inputs. Object property order does not affect the key. Defaults to null. */
-  inputs?: JsonValue;
-  /** Named file locators. path is always project-root-relative; url resolves to a backing file through Vite (or a local file: URL in Node). Resolved names and paths affect the key; contents only affect validation. */
-  fileDependencies?: FileDependencies;
+  /** Named dependencies sorted by name. JSON values affect the key; file contents and installed package versions are validated in Node or through the Vite plugin. Paths are always project-root-relative. URLs resolve to those paths through Vite, or from local file: URLs in Node. Packages track only the declared package's installed version, without importing it. */
+  dependencies?: Dependencies;
   /** Disk directory in Node (default public/_vitecache); URL prefix in browsers (default /_vitecache/). Excluded from the key. */
   basePath?: string;
   /** Node project root, default process.cwd(). Browser dependencies resolve against the Vite root. Excluded from the key. */
@@ -24,9 +30,9 @@ export interface Stored {
 
 export interface Backend {
   canSave(): Promise<boolean>;
-  resolve(files: FileDependencies): Promise<Paths>;
-  /** null means a missing dependency; undefined means validation is unavailable. */
-  snapshot(files: Paths): Promise<Hashes | null | undefined>;
+  resolve(dependencies: Dependencies): Promise<ResolvedDependencies>;
+  /** null means a missing dependency; undefined means validation is unavailable. Values need no fingerprint. */
+  snapshot(dependencies: ResolvedDependencies): Promise<Hashes | null | undefined>;
   load(key: string, validate: boolean): Promise<Stored | undefined>;
-  save(key: string, value: Uint8Array, files: Paths, expected: Hashes): Promise<void>;
+  save(key: string, value: Uint8Array, dependencies: ResolvedDependencies, expected: Hashes): Promise<void>;
 }

@@ -1,17 +1,18 @@
 {
-  "name": "@drawcall/vitecache-example-mandelbrot",
+  "name": "@drawcall/vitecache-example-graph-layout",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "precompute": "tsx src/precompute.ts",
+    "precompute": "tsx src/compute.ts",
     "build": "pnpm precompute && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@drawcall/vitecache": "workspace:*"
+    "@drawcall/vitecache": "workspace:*",
+    "elkjs": "0.12.0"
   },
   "devDependencies": {
     "tsx": "^4.20.6",

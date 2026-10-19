@@ -1,24 +1,30 @@
 import { dependencies, equalHashes } from './dependencies.js';
-import { identity, key } from './key.js';
-import type { Backend, CacheEntryOptions, FileDependencies, Hashes, Paths } from './types.js';
+import { key } from './key.js';
+import type { Backend, CacheEntryOptions, Dependencies, Hashes, ResolvedDependencies } from './types.js';
 
 export class Entry {
-  readonly #identity: string;
-  #resolution: Promise<{ key: string; files: Paths }> | undefined;
-  readonly #files: FileDependencies;
+  readonly #version: string;
+  #resolution: Promise<{ key: string; validation: ResolvedDependencies }> | undefined;
+  readonly #dependencies: Dependencies;
+  readonly #validates: boolean;
   readonly #backend: Backend;
   #baseline: Hashes | null | undefined;
   #prepared = false;
   #pending = false;
 
   constructor(options: CacheEntryOptions, backend: Backend) {
-    this.#files = dependencies(options.fileDependencies ?? {});
-    this.#identity = identity(options);
+    if (typeof options.version !== 'string' || !options.version) throw new TypeError('CacheEntry requires a nonempty version.');
+    this.#dependencies = dependencies(options.dependencies ?? {});
+    this.#validates = Object.values(this.#dependencies).some((dependency) => !Object.hasOwn(dependency, 'value'));
+    this.#version = options.version;
     this.#backend = backend;
   }
 
-  #resolve(): Promise<{ key: string; files: Paths }> {
-    this.#resolution ??= this.#backend.resolve(this.#files).then((files) => ({ key: key(this.#identity, files), files })).catch((error: unknown) => {
+  #resolve(): Promise<{ key: string; validation: ResolvedDependencies }> {
+    this.#resolution ??= this.#backend.resolve(this.#dependencies).then((dependencies) => ({
+      key: key(this.#version, dependencies),
+      validation: Object.fromEntries(Object.entries(dependencies).filter(([, dependency]) => !Object.hasOwn(dependency, 'value'))),
+    })).catch((error: unknown) => {
       this.#resolution = undefined;
       throw error;
     });
@@ -37,7 +43,7 @@ export class Entry {
   /** Returns undefined for missing or stale results. A miss captures dependency hashes until the next save attempt finishes. */
   async load(): Promise<Uint8Array | undefined> {
     const resolved = await this.#resolve();
-    const snapshot = await this.#backend.snapshot(resolved.files);
+    const snapshot = await this.#backend.snapshot(resolved.validation);
     if (!this.#pending) {
       this.#baseline = snapshot;
       this.#prepared = true;
@@ -54,7 +60,7 @@ export class Entry {
     return stored.bytes;
   }
 
-  /** Saves bytes on disk. With dependencies, call load()/has() before computing; changed dependencies reject the save. Without the Vite plugin, browser saves warn and skip the write. */
+  /** Saves bytes on disk. With file or package dependencies, call load()/has() before computing; changed dependencies reject the save. Without the Vite plugin, browser saves warn and skip the write. */
   async save(value: Uint8Array): Promise<void> {
     const bytes = new Uint8Array(value);
     const expected = this.#baseline;
@@ -63,12 +69,12 @@ export class Entry {
         console.warn('vitecache: save skipped. Install the vitecache Vite plugin to write cache files from the browser.');
         return;
       }
-      if (Object.keys(this.#files).length && !this.#prepared) {
-        throw new Error('Call CacheEntry.load() or has() before computing a result with file dependencies.');
+      if (this.#validates && !this.#prepared) {
+        throw new Error('Call CacheEntry.load() or has() before computing a result with file or package dependencies.');
       }
-      if (expected === null) throw new Error('Cannot save a cache entry with missing file dependencies.');
+      if (expected === null) throw new Error('Cannot save a cache entry with missing file or package dependencies.');
       const resolved = await this.#resolve();
-      await this.#backend.save(resolved.key, bytes, resolved.files, expected ?? {});
+      await this.#backend.save(resolved.key, bytes, resolved.validation, expected ?? {});
     } finally {
       this.#prepared = false;
       this.#pending = false;
