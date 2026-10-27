@@ -1,6 +1,6 @@
 {
-  "name": "@drawcall/vitecache",
-  "version": "0.1.0",
+  "name": "vitecache",
+  "version": "0.1.1",
   "description": "Persistent binary caching for expensive computation in browsers and Node.",
   "type": "module",
   "license": "MIT",

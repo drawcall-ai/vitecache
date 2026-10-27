@@ -8,7 +8,7 @@ const execute = promisify(execFile);
 
 test('selects Node exports and bundles the browser entry without filesystem code', async () => {
   const { stdout } = await execute(process.execPath, ['--input-type=module', '-e',
-    "import * as api from '@drawcall/vitecache'; console.log(import.meta.resolve('@drawcall/vitecache')); console.log(Object.keys(api).join(','));",
+    "import * as api from 'vitecache'; console.log(import.meta.resolve('vitecache')); console.log(Object.keys(api).join(','));",
   ]);
   const [path, exports] = stdout.trim().split('\n');
   expect(path).toMatch(/\/dist\/node\.js$/);
@@ -22,7 +22,7 @@ test('selects Node exports and bundles the browser entry without filesystem code
         if (id === resolve('consumer')) return '\0consumer';
       },
       load(id) {
-        if (id === '\0consumer') return "export { CacheEntry } from '@drawcall/vitecache';";
+        if (id === '\0consumer') return "export { CacheEntry } from 'vitecache';";
       },
     }],
     build: { write: false, minify: false, lib: { entry: 'consumer', formats: ['es'] } },

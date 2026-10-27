@@ -8,8 +8,8 @@
     "check": "pnpm build && pnpm typecheck && pnpm test",
     "test": "pnpm -r --if-present test",
     "typecheck": "pnpm -r --if-present typecheck",
-    "dev": "pnpm --filter @drawcall/vitecache build && pnpm --filter @drawcall/vitecache-example-graph-layout dev",
-    "precompute": "pnpm --filter @drawcall/vitecache build && pnpm --filter @drawcall/vitecache-example-graph-layout precompute"
+    "dev": "pnpm --filter vitecache build && pnpm --filter @drawcall/vitecache-example-graph-layout dev",
+    "precompute": "pnpm --filter vitecache build && pnpm --filter @drawcall/vitecache-example-graph-layout precompute"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

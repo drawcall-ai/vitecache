@@ -1,6 +1,6 @@
 ---
 name: vitecache
-description: Cache expensive computation with @drawcall/vitecache in browsers or Node, connect browser saves to a Vite development server, and reuse cached bytes in deployed apps.
+description: Cache expensive computation with vitecache in browsers or Node, connect browser saves to a Vite development server, and reuse cached bytes in deployed apps.
 ---
 
 # vitecache
@@ -14,7 +14,7 @@ Reordering JSON object properties or dependency declarations does not change ide
 Load once and compute on a miss. Reuse that entry when saving: loading captures file contents and package versions before computation, allowing saving to reject a result if those dependencies changed in the meantime. A new entry or a save without a preceding load cannot establish that relationship. Entries containing only value dependencies can save directly. If saving fails because dependencies changed, load again and recompute before retrying. Use a separate entry for each concurrent computation.
 
 ```ts
-import { CacheEntry } from "@drawcall/vitecache"
+import { CacheEntry } from "vitecache"
 import modelUrl from "./models/chair.glb?url"
 
 const entry = new CacheEntry({
@@ -40,7 +40,7 @@ Use the Vite plugin when browser computation should produce reusable project fil
 
 ```ts
 import { defineConfig } from "vite"
-import { vitecache } from "@drawcall/vitecache/vite"
+import { vitecache } from "vitecache/vite"
 
 export default defineConfig({ plugins: [vitecache()] })
 ```

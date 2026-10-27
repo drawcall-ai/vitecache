@@ -1,4 +1,4 @@
-import { CacheEntry } from '@drawcall/vitecache';
+import { CacheEntry } from 'vitecache';
 
 const graph = {
   nodes: ['Content', 'Images', 'Styles', 'Parse', 'Resize', 'Compile', 'HTML', 'Assets', 'CSS', 'Bundle', 'Website'],

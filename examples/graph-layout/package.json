@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@drawcall/vitecache": "workspace:*",
+    "vitecache": "workspace:*",
     "elkjs": "0.12.0"
   },
   "devDependencies": {

@@ -17,12 +17,12 @@ importers:
 
   examples/graph-layout:
     dependencies:
-      '@drawcall/vitecache':
-        specifier: workspace:*
-        version: link:../../packages/vitecache
       elkjs:
         specifier: 0.12.0
         version: 0.12.0
+      vitecache:
+        specifier: workspace:*
+        version: link:../../packages/vitecache
     devDependencies:
       tsx:
         specifier: ^4.20.6

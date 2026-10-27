@@ -35,6 +35,6 @@ jobs:
           npm --prefix packages/vitecache pkg set version="$version"
       - run: pnpm check
       # npm trusted publisher: drawcall-ai/vitecache, publish-package.yml, no environment.
-      - name: Publish @drawcall/vitecache
+      - name: Publish vitecache
         working-directory: packages/vitecache
         run: npm publish --access public --provenance --tag latest

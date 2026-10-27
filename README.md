@@ -3,11 +3,11 @@
 Cache expensive computation as bytes, then reuse it across browser sessions and Node runs.
 
 ```sh
-pnpm add @drawcall/vitecache
+pnpm add vitecache
 ```
 
 ```ts
-import { CacheEntry } from "@drawcall/vitecache"
+import { CacheEntry } from "vitecache"
 import modelUrl from "./models/chair.glb?url"
 
 const entry = new CacheEntry({
@@ -39,7 +39,7 @@ Node reads and writes `<project_root>/public/_vitecache/`. Add the plugin to sav
 
 ```ts
 import { defineConfig } from "vite"
-import { vitecache } from "@drawcall/vitecache/vite"
+import { vitecache } from "vitecache/vite"
 
 export default defineConfig({ plugins: [vitecache()] })
 ```

@@ -1,4 +1,4 @@
-import { vitecache } from '@drawcall/vitecache/vite';
+import { vitecache } from 'vitecache/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
