@@ -1,11 +1,15 @@
+import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as disk from './disk.js';
 import { equalHashes, hashes, resolvedDependencies } from './dependencies.js';
 import { packageVersion } from './packages.js';
-import { digest } from './key.js';
 import type { Backend, CacheEntryOptions, Dependencies, Hashes, ResolvedDependencies } from './types.js';
+
+function digest(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
 
 interface Metadata {
   contentHash: string;
