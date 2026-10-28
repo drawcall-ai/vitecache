@@ -1,10 +1,12 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, expect, test, vi } from 'vitest';
 import * as disk from '../src/disk.js';
+import { digest, key } from '../src/key.js';
 import { CacheEntry } from '../src/node.js';
+import { createStorage } from '../src/storage.js';
 
 const roots: string[] = [];
 async function project(): Promise<string> {
@@ -83,17 +85,48 @@ test('persists binary values and metadata and appends one ignore entry', async (
   expect(await readFile(join(root, '.gitignore'), 'utf8')).toBe('node_modules\npublic/_vitecache/*\n');
 });
 
+test.each([
+  { name: 'Uint8Array view', bytes: new Uint8Array([42, 0, 255, 128, 42]).subarray(1, 4) },
+  { name: 'Buffer view', bytes: Buffer.from([42, 0, 255, 128, 42]).subarray(1, 4) },
+  { name: 'empty payload', bytes: new Uint8Array() },
+])('storage reads and writes compatible metadata for $name', async ({ bytes }) => {
+  const root = await project();
+  const source = new TextEncoder().encode('模型');
+  await writeFile(join(root, 'source'), source);
+  await installedPackage(root, 'layout', '1.2.3');
+  const dependencies = { source: { path: 'source' }, engine: { package: 'layout' } };
+  const options = { root, version: 'compatible@1', dependencies };
+  const cacheKey = key(options.version, dependencies);
+  const directory = join(root, 'public/_vitecache');
+  const record = {
+    contentHash: digest(bytes),
+    dependencies: { source: digest(source), engine: digest(new TextEncoder().encode('1.2.3')) },
+  };
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, `${cacheKey}.bin`), bytes);
+  const metadata = join(directory, `${cacheKey}.json`);
+  await writeFile(metadata, JSON.stringify(record));
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from(bytes));
+
+  await createStorage({ root }).save(cacheKey, bytes, dependencies, record.dependencies);
+  expect(JSON.parse(await readFile(metadata, 'utf8'))).toEqual(record);
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from(bytes));
+});
+
 test('validates named dependencies by content and rejects changes during computation', async () => {
   const root = await project();
   const source = join(root, 'model.bin');
   await writeFile(source, 'first');
+  const timestamp = new Date('2024-01-01T00:00:00Z');
+  await utimes(source, timestamp, timestamp);
   const options = { root, version: 'transform@1', dependencies: { model: { path: 'model.bin' } } };
   const entry = new CacheEntry(options);
   await expect(entry.save(new Uint8Array([1]))).rejects.toThrow();
   expect(await entry.load()).toBeUndefined();
   await entry.save(new Uint8Array([1]));
   expect(await new CacheEntry(options).load()).toEqual(Buffer.from([1]));
-  await writeFile(source, 'second');
+  await writeFile(source, 'other');
+  await utimes(source, timestamp, timestamp);
   expect(await entry.has()).toBe(false);
   await writeFile(source, 'third');
   await expect(entry.save(new Uint8Array([2]))).rejects.toThrow(/changed/);
