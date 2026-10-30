@@ -19,6 +19,28 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+test('saved dependencies validate a result without entering its key', async () => {
+  const root = await project();
+  await writeFile(join(root, 'helper'), 'before');
+  await writeFile(join(root, 'other'), 'other');
+  await installedPackage(root, 'compute', '1.0.0');
+  const options = { root, version: 'saved@1', dependencies: { input: { value: 1 } } };
+  const entry = new CacheEntry(options);
+  await entry.save(new Uint8Array([1]), { dependencies: { helper: { url: pathToFileURL(join(root, 'helper')).href }, engine: { package: 'compute' } } });
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from([1]));
+  await writeFile(join(root, 'helper'), 'after');
+  expect(await new CacheEntry(options).load()).toBeUndefined();
+
+  await entry.save(new Uint8Array([2]), { dependencies: { other: { path: 'other' } } });
+  expect(await new CacheEntry(options).load()).toEqual(Buffer.from([2]));
+  expect(await readdir(join(root, 'public/_vitecache'))).toHaveLength(2);
+  await unlink(join(root, 'other'));
+  expect(await new CacheEntry(options).has()).toBe(false);
+  await expect(entry.save(new Uint8Array([3]), { dependencies: { other: { path: 'other' } } })).rejects.toThrow(/missing/);
+  // @ts-expect-error Values select the result and belong to the constructor.
+  await expect(entry.save(new Uint8Array([3]), { dependencies: { setting: { value: 2 } } })).rejects.toThrow(TypeError);
+});
+
 test('a dependency change while staging bytes does not publish the rejected result', async () => {
   const root = await project();
   const source = join(root, 'source');
@@ -108,7 +130,7 @@ test.each([
   await writeFile(metadata, JSON.stringify(record));
   expect(await new CacheEntry(options).load()).toEqual(Buffer.from(bytes));
 
-  await createStorage({ root }).save(cacheKey, bytes, dependencies, record.dependencies);
+  await createStorage({ root }).save(cacheKey, bytes, dependencies, record.dependencies, {});
   expect(JSON.parse(await readFile(metadata, 'utf8'))).toEqual(record);
   expect(await new CacheEntry(options).load()).toEqual(Buffer.from(bytes));
 });
@@ -151,7 +173,10 @@ test('torn writes miss while malformed metadata and filesystem failures remain v
   await writeFile(binary, new Uint8Array([8]));
   expect(await entry.load()).toBeUndefined();
   await writeFile(metadata, '{}');
-  await expect(entry.load()).rejects.toThrow(/metadata/);
+  await expect(entry.load()).rejects.toThrow(`Invalid vitecache metadata: ${metadata}`);
+  // A malformed saved dependency is the cache file's fault, not a caller's TypeError.
+  await writeFile(metadata, JSON.stringify({ contentHash: digest(new Uint8Array([8])), dependencies: {}, saved: { setting: { dependency: { value: 1 }, hash: digest(new Uint8Array()) } } }));
+  await expect(entry.load()).rejects.toThrow(expect.objectContaining({ name: 'Error', message: `Invalid vitecache metadata: ${metadata}` }));
   await unlink(metadata);
   expect(await entry.load()).toBeUndefined();
   await writeFile(join(root, 'blocked'), 'a file');

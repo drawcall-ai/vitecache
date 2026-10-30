@@ -8,9 +8,18 @@ export type Dependency =
   | { readonly package: string; readonly value?: never; readonly path?: never; readonly url?: never };
 export type Dependencies = Readonly<Record<string, Dependency>>;
 export type ResolvedDependency = Exclude<Dependency, { readonly url: string }>;
+/** A file, URL, or package dependency: one whose current state can be checked again later. */
+export type SavedDependency = Exclude<Dependency, { readonly value: JsonValue }>;
+export type SavedDependencies = Readonly<Record<string, SavedDependency>>;
 export type ResolvedDependencies = Readonly<Record<string, ResolvedDependency>>;
 export type Paths = Readonly<Record<string, string>>;
+/** Dependency names mapped to file-content or installed-package-version hashes. */
 export type Hashes = Readonly<Record<string, string>>;
+/** Current dependency hashes, a missing dependency, or unavailable browser validation. */
+export type Snapshot =
+  | { readonly status: 'available'; readonly hashes: Hashes }
+  | { readonly status: 'missing' }
+  | { readonly status: 'unavailable' };
 
 export interface CacheEntryOptions {
   /** Identifies the computation and its implementation version, for example "simplify@2". */
@@ -23,6 +32,17 @@ export interface CacheEntryOptions {
   root?: string;
 }
 
+export interface SaveOptions {
+  /**
+   * What the result was built from, when known only after computing it. They do not affect the key, so a save with
+   * different saved dependencies replaces the same entry. Rechecked by every load() where file contents are validated;
+   * a changed or missing one is a miss. Hashed when save() runs, so one that changed after the computation read it goes
+   * unnoticed until it changes again. One without a backing file makes save() throw MissingDependencyError. Values select
+   * the result, so they belong in the constructor.
+   */
+  dependencies?: SavedDependencies;
+}
+
 export interface Stored {
   bytes: Uint8Array;
   hashes?: Hashes;
@@ -31,8 +51,8 @@ export interface Stored {
 export interface Backend {
   canSave(): Promise<boolean>;
   resolve(dependencies: Dependencies): Promise<ResolvedDependencies>;
-  /** null means a missing dependency; undefined means validation is unavailable. Values need no fingerprint. */
-  snapshot(dependencies: ResolvedDependencies): Promise<Hashes | null | undefined>;
+  snapshot(dependencies: ResolvedDependencies): Promise<Snapshot>;
   load(key: string, validate: boolean): Promise<Stored | undefined>;
-  save(key: string, value: Uint8Array, dependencies: ResolvedDependencies, expected: Hashes): Promise<void>;
+  /** `validation` must still match `expected`; `saved` is hashed now and rechecked on load. Neither holds values. */
+  save(key: string, value: Uint8Array, validation: ResolvedDependencies, expected: Hashes, saved: ResolvedDependencies): Promise<void>;
 }

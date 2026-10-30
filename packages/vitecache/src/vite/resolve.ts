@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { ViteDevServer } from 'vite';
 import type { Dependencies, ResolvedDependencies, ResolvedDependency } from '../types.js';
 import * as disk from '../disk.js';
+import { MissingDependencyError } from '../dependencies.js';
 
 export class OutsideRootError extends Error {
   constructor() {
@@ -58,10 +59,11 @@ export async function resolveDependencies(server: ViteDevServer, dependencies: D
     else if (await exists(rootFile)) file = rootFile;
     else {
       const module = await server.pluginContainer.resolveId(pathname);
-      if (!module || !isAbsolute(module.id)) throw new TypeError(`Cannot resolve file dependency URL: ${dependency.url}`);
+      // A virtual module is served without a file whose contents could be hashed.
+      if (!module || !isAbsolute(module.id)) throw new MissingDependencyError(`File dependency URL has no backing file: ${dependency.url}`);
       file = module.id.split('?')[0] ?? module.id;
     }
-    if (!await exists(file)) throw new TypeError(`File dependency URL has no backing file: ${dependency.url}`);
+    if (!await exists(file)) throw new MissingDependencyError(`File dependency URL has no backing file: ${dependency.url}`);
     const path = inside(server.config.root, file)
       ? relative(server.config.root, file)
       : relative(await realpath(server.config.root), await realpath(file));

@@ -12,7 +12,7 @@ test('selects Node exports and bundles the browser entry without filesystem code
   ]);
   const [path, exports] = stdout.trim().split('\n');
   expect(path).toMatch(/\/dist\/node\.js$/);
-  expect(exports).toBe('CacheEntry');
+  expect(exports).toBe('CacheEntry,MissingDependencyError');
   const bundle = await build({
     configFile: false,
     logLevel: 'silent',

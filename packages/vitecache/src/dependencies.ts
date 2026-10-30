@@ -1,4 +1,9 @@
-import type { Dependencies, Dependency, Hashes, JsonValue, Paths, ResolvedDependencies, ResolvedDependency } from './types.js';
+import type { Dependencies, Dependency, Hashes, JsonValue, Paths, ResolvedDependencies, ResolvedDependency, SavedDependencies, SavedDependency } from './types.js';
+
+/** A file or package dependency has no backing file or installation, so its state cannot be checked. */
+export class MissingDependencyError extends Error {
+  override name = 'MissingDependencyError';
+}
 
 export function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -85,6 +90,15 @@ export function dependencies(value: unknown): Dependencies {
 export function resolvedDependencies(value: unknown): ResolvedDependencies {
   const entries = Object.entries(dependencies(value)).map(([name, dependency]): [string, ResolvedDependency] => {
     if (dependency.url !== undefined) throw new TypeError('Expected resolved dependencies, not URLs.');
+    return [name, dependency];
+  });
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+/** Saved dependencies are rechecked later, so they cannot be values: values select the result and belong to the key. */
+export function savedDependencies(value: unknown): SavedDependencies {
+  const entries = Object.entries(dependencies(value)).map(([name, dependency]): [string, SavedDependency] => {
+    if (dependency.value !== undefined) throw new TypeError('Saved dependencies cannot be values: values select the result; pass them to the constructor.');
     return [name, dependency];
   });
   return Object.freeze(Object.fromEntries(entries));

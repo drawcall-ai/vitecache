@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "precompute": "tsx src/compute.ts",
+    "precompute": "node --import tsx src/compute.ts",
     "build": "pnpm precompute && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
