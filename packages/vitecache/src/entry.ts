@@ -1,6 +1,6 @@
-import { dependencies, equalHashes } from './dependencies.js';
+import { dependencies, equalHashes, MissingDependencyError, savedDependencies } from './dependencies.js';
 import { key } from './key.js';
-import type { Backend, CacheEntryOptions, Dependencies, Hashes, ResolvedDependencies } from './types.js';
+import type { Backend, CacheEntryOptions, Dependencies, ResolvedDependencies, SaveOptions, Snapshot } from './types.js';
 
 export class Entry {
   readonly #version: string;
@@ -8,7 +8,7 @@ export class Entry {
   readonly #dependencies: Dependencies;
   readonly #validates: boolean;
   readonly #backend: Backend;
-  #baseline: Hashes | null | undefined;
+  #baseline: Snapshot | undefined;
   #prepared = false;
   #pending = false;
 
@@ -31,29 +31,40 @@ export class Entry {
     return this.#resolution;
   }
 
+  async #snapshot(): Promise<Snapshot> {
+    try {
+      return await this.#backend.snapshot((await this.#resolve()).validation);
+    } catch (error) {
+      if (!(error instanceof MissingDependencyError)) throw error;
+      return { status: 'missing' };
+    }
+  }
+
   /** Checks validity like load(). Warns on browser misses without the Vite plugin. */
   async has(): Promise<boolean> {
     const found = await this.load() !== undefined;
-    if (!found && this.#baseline === undefined) {
-      console.warn(`vitecache: cache miss for ${(await this.#resolve()).key}. Install the vitecache Vite plugin to generate cache files.`);
+    if (!found && !await this.#backend.canSave()) {
+      console.warn(`vitecache: cache miss for ${this.#version}. Install the vitecache Vite plugin to generate cache files.`);
     }
     return found;
   }
 
-  /** Returns undefined for missing or stale results. A miss captures dependency hashes until the next save attempt finishes. */
+  /** Returns undefined for missing dependencies or missing/stale results, saved dependencies included. A miss captures dependency hashes until the next save attempt finishes. */
   async load(): Promise<Uint8Array | undefined> {
-    const resolved = await this.#resolve();
-    const snapshot = await this.#backend.snapshot(resolved.validation);
+    // Value dependencies are fully captured by the key, so there is nothing to validate or baseline.
+    if (!this.#validates) return (await this.#backend.load((await this.#resolve()).key, false))?.bytes;
+    const snapshot = await this.#snapshot();
     if (!this.#pending) {
       this.#baseline = snapshot;
       this.#prepared = true;
     }
-    if (snapshot === null) {
+    if (snapshot.status === 'missing') {
       this.#pending = true;
       return undefined;
     }
-    const stored = await this.#backend.load(resolved.key, snapshot !== undefined);
-    if (!stored || (snapshot !== undefined && (!stored.hashes || !equalHashes(snapshot, stored.hashes)))) {
+    const { key } = await this.#resolve();
+    const stored = await this.#backend.load(key, snapshot.status === 'available');
+    if (!stored || (snapshot.status === 'available' && (!stored.hashes || !equalHashes(snapshot.hashes, stored.hashes)))) {
       this.#pending = true;
       return undefined;
     }
@@ -61,8 +72,9 @@ export class Entry {
   }
 
   /** Saves bytes on disk. With file or package dependencies, call load()/has() before computing; changed dependencies reject the save. Without the Vite plugin, browser saves warn and skip the write. */
-  async save(value: Uint8Array): Promise<void> {
+  async save(value: Uint8Array, options: SaveOptions = {}): Promise<void> {
     const bytes = new Uint8Array(value);
+    const saved = savedDependencies(options.dependencies ?? {});
     const expected = this.#baseline;
     try {
       if (!await this.#backend.canSave()) {
@@ -72,9 +84,10 @@ export class Entry {
       if (this.#validates && !this.#prepared) {
         throw new Error('Call CacheEntry.load() or has() before computing a result with file or package dependencies.');
       }
-      if (expected === null) throw new Error('Cannot save a cache entry with missing file or package dependencies.');
+      if (expected?.status === 'missing') throw new MissingDependencyError('Cannot save a cache entry with missing file or package dependencies.');
       const resolved = await this.#resolve();
-      await this.#backend.save(resolved.key, bytes, resolved.validation, expected ?? {});
+      const hashes = expected?.status === 'available' ? expected.hashes : {};
+      await this.#backend.save(resolved.key, bytes, resolved.validation, hashes, await this.#backend.resolve(saved));
     } finally {
       this.#prepared = false;
       this.#pending = false;

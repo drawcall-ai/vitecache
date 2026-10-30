@@ -4,7 +4,7 @@ import type { Plugin, ResolvedConfig, ViteDevServer } from 'vite';
 import * as disk from '../disk.js';
 import { ChangedDependenciesError, createStorage } from '../storage.js';
 import type { Backend } from '../types.js';
-import { dependencies, hashes, resolvedDependencies } from '../dependencies.js';
+import { dependencies, hashes, MissingDependencyError, resolvedDependencies, savedDependencies } from '../dependencies.js';
 import { confine, inside, OutsideRootError, resolveDependencies } from './resolve.js';
 import { assetUrl, publicPaths } from './manifest.js';
 
@@ -22,6 +22,7 @@ class RequestError extends Error {
 function status(error: unknown): number {
   if (error instanceof RequestError) return error.status;
   if (error instanceof ChangedDependenciesError) return 409;
+  if (error instanceof MissingDependencyError) return 404;
   if (error instanceof OutsideRootError) return 403;
   if (error instanceof TypeError || error instanceof URIError) return 400;
   return 500;
@@ -66,15 +67,16 @@ function validate<T>(value: unknown, parser: (value: unknown) => T): T {
   }
 }
 
-function header(request: IncomingMessage, name: string): unknown {
-  const value = request.headers[name];
-  if (typeof value !== 'string') throw new RequestError(400, `Missing ${name} header`);
-  try {
-    return parse(decodeURIComponent(value));
-  } catch (error) {
-    if (!(error instanceof URIError)) throw error;
-    throw new RequestError(400, 'Invalid encoded request header');
+/** A save body: a 4-byte big-endian metadata length, that much JSON metadata, then the cached bytes. */
+function upload(bytes: Uint8Array): { metadata: Record<string, unknown>; value: Uint8Array } {
+  if (bytes.byteLength < 4) throw new RequestError(400, 'Expected a metadata length');
+  const end = 4 + new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0);
+  if (end > bytes.byteLength) throw new RequestError(400, 'Truncated save metadata');
+  const metadata = parse(new TextDecoder().decode(bytes.subarray(4, end)));
+  if (typeof metadata !== 'object' || metadata === null || !('dependencies' in metadata) || !('hashes' in metadata) || !('saved' in metadata)) {
+    throw new RequestError(400, 'Expected dependencies, hashes, and saved dependencies');
   }
+  return { metadata, value: bytes.subarray(end) };
 }
 
 function json(response: ServerResponse, value: unknown): void {
@@ -109,7 +111,7 @@ async function respond(
     }
     const deps = validate(value.dependencies, resolvedDependencies);
     await confine(root, deps);
-    json(response, { hashes: await storage.snapshot(deps) });
+    json(response, await storage.snapshot(deps));
     return;
   }
   if (!/^[a-f0-9]{64}\.bin$/.test(name)) {
@@ -120,10 +122,13 @@ async function respond(
   const key = name.slice(0, -4);
   if (request.method === 'PUT') {
     if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
-    const deps = validate(header(request, 'x-vitecache-dependencies'), resolvedDependencies);
-    const expected = validate(header(request, 'x-vitecache-hashes'), hashes);
-    await confine(root, deps);
-    await storage.save(key, await body(request), deps, expected);
+    const { metadata, value } = upload(await body(request));
+    const validation = validate(metadata.dependencies, resolvedDependencies);
+    const expected = validate(metadata.hashes, hashes);
+    const saved = validate(metadata.saved, (input) => resolvedDependencies(savedDependencies(input)));
+    await confine(root, validation);
+    await confine(root, saved);
+    await storage.save(key, value, validation, expected, saved);
     response.statusCode = 204;
     response.end();
     return;
@@ -136,7 +141,8 @@ async function respond(
   }
   const stored = await storage.load(key, true);
   if (stored === undefined) {
-    response.statusCode = 404;
+    // Browsers log every 404 fetch as an error, and a miss is an expected answer.
+    response.statusCode = 204;
     response.end();
     return;
   }
@@ -161,7 +167,7 @@ export function vitecache(options: VitecacheOptions = {}): Plugin {
       }
       const base = new URL(config.base, 'http://vitecache').pathname.replace(/\/$/, '');
       resolved = {
-        backend: createStorage({ root, ...options }),
+        backend: createStorage({ root, ...options, memoizeHashes: config.command === 'serve' }),
         root,
         directory,
         config,
@@ -198,6 +204,10 @@ export function vitecache(options: VitecacheOptions = {}): Plugin {
         }
         void respond(request, response, path.slice(storage.prefix.length), storage.backend, server).catch((error: unknown) => {
           response.statusCode = status(error);
+          if (error instanceof MissingDependencyError) {
+            json(response, { error: 'missing-dependency', message: error.message });
+            return;
+          }
           response.setHeader('Content-Type', 'text/plain');
           response.end(error instanceof Error ? error.message : 'vitecache request failed');
         });
