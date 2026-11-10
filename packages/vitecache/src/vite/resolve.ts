@@ -1,46 +1,54 @@
 import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import type { ViteDevServer } from 'vite';
-import type { Dependencies, ResolvedDependencies, ResolvedDependency } from '../types.js';
+import type { Dependencies, Resolved } from '../types.js';
 import * as disk from '../disk.js';
 import { MissingDependencyError } from '../dependencies.js';
 
-export class OutsideRootError extends Error {
-  constructor() {
-    super('File dependencies must be inside the project root');
+/** A request the plugin refuses, answered with `status` and the message. */
+export class RequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
   }
 }
 
-export function inside(root: string, path: string): boolean {
-  const name = relative(root, path);
-  return name !== '..' && !name.startsWith(`..${sep}`) && !isAbsolute(name);
+function outsideRoot(): RequestError {
+  return new RequestError(403, 'File dependencies must be inside the project root');
 }
 
-export async function confine(root: string, dependencies: ResolvedDependencies): Promise<void> {
+export async function confine(root: string, dependencies: Dependencies<Resolved>): Promise<void> {
   const canonicalRoot = await realpath(root);
   for (const dependency of Object.values(dependencies)) {
     if (!('path' in dependency)) continue;
     const path = resolve(root, dependency.path);
-    if (!inside(root, path)) throw new OutsideRootError();
+    if (!disk.inside(root, path)) throw outsideRoot();
     try {
-      if (!inside(canonicalRoot, await realpath(path))) throw new OutsideRootError();
+      if (!disk.inside(canonicalRoot, await realpath(path))) throw outsideRoot();
     } catch (error) {
-      if (!disk.missingDependency(error)) throw error;
+      if (!disk.notFound(error)) throw error;
     }
   }
 }
 
-async function exists(path: string): Promise<boolean> {
+async function isFile(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isFile();
   } catch (error) {
-    if (!disk.missingDependency(error)) throw error;
+    if (!disk.notFound(error)) throw error;
     return false;
   }
 }
 
-export async function resolveDependencies(server: ViteDevServer, dependencies: Dependencies, origin: string): Promise<ResolvedDependencies> {
-  const entries: [string, ResolvedDependency][] = [];
+function decoded(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    throw new RequestError(400, `Malformed file dependency URL: ${pathname}`);
+  }
+}
+
+export async function resolveDependencies(server: ViteDevServer, dependencies: Dependencies, origin: string): Promise<Dependencies<Resolved>> {
+  const entries: [string, Resolved][] = [];
   const base = new URL(server.config.base, origin).pathname;
   for (const [name, dependency] of Object.entries(dependencies)) {
     if (!('url' in dependency)) {
@@ -48,26 +56,23 @@ export async function resolveDependencies(server: ViteDevServer, dependencies: D
       continue;
     }
     const url = new URL(dependency.url, origin);
-    if (url.origin !== origin) throw new TypeError('File dependency URLs must have the Vite server origin');
-    if (!url.pathname.startsWith(base)) throw new TypeError('File dependency URL is outside the Vite base');
-    const pathname = decodeURIComponent(`/${url.pathname.slice(base.length)}`);
+    if (url.origin !== origin) throw new RequestError(400, 'File dependency URLs must have the Vite server origin');
+    if (!url.pathname.startsWith(base)) throw new RequestError(400, 'File dependency URL is outside the Vite base');
+    const pathname = decoded(`/${url.pathname.slice(base.length)}`);
     const publicFile = resolve(server.config.publicDir, `.${pathname}`);
     const rootFile = resolve(server.config.root, `.${pathname}`);
     let file: string;
-    if (server.config.publicDir && await exists(publicFile)) file = publicFile;
+    if (await isFile(publicFile)) file = publicFile;
     else if (pathname.startsWith('/@fs/')) file = pathname.slice('/@fs'.length).replace(/^\/([A-Za-z]:\/)/, '$1');
-    else if (await exists(rootFile)) file = rootFile;
+    else if (await isFile(rootFile)) file = rootFile;
     else {
       const module = await server.pluginContainer.resolveId(pathname);
       // A virtual module is served without a file whose contents could be hashed.
       if (!module || !isAbsolute(module.id)) throw new MissingDependencyError(`File dependency URL has no backing file: ${dependency.url}`);
       file = module.id.split('?')[0] ?? module.id;
     }
-    if (!await exists(file)) throw new MissingDependencyError(`File dependency URL has no backing file: ${dependency.url}`);
-    const path = inside(server.config.root, file)
-      ? relative(server.config.root, file)
-      : relative(await realpath(server.config.root), await realpath(file));
-    entries.push([name, { path: path.split(sep).join('/') }]);
+    if (!await isFile(file)) throw new MissingDependencyError(`File dependency URL has no backing file: ${dependency.url}`);
+    entries.push([name, { path: await disk.rootRelative(server.config.root, file) }]);
   }
   const resolved = Object.fromEntries(entries);
   await confine(server.config.root, resolved);

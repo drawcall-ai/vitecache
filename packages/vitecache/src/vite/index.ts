@@ -2,10 +2,10 @@ import { relative, resolve, sep } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin, ResolvedConfig, ViteDevServer } from 'vite';
 import * as disk from '../disk.js';
-import { ChangedDependenciesError, createStorage } from '../storage.js';
-import type { Backend } from '../types.js';
-import { dependencies, hashes, MissingDependencyError, resolvedDependencies, savedDependencies } from '../dependencies.js';
-import { confine, inside, OutsideRootError, resolveDependencies } from './resolve.js';
+import { createStorage } from '../storage.js';
+import type { Storage } from '../storage.js';
+import { ChangedDependenciesError, dependencies, hashableDependencies, hashes, MissingDependencyError } from '../dependencies.js';
+import { confine, RequestError, resolveDependencies } from './resolve.js';
 import { assetUrl, publicPaths } from './manifest.js';
 
 export interface VitecacheOptions {
@@ -13,18 +13,9 @@ export interface VitecacheOptions {
   basePath?: string;
 }
 
-class RequestError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message);
-  }
-}
-
 function status(error: unknown): number {
   if (error instanceof RequestError) return error.status;
   if (error instanceof ChangedDependenciesError) return 409;
-  if (error instanceof MissingDependencyError) return 404;
-  if (error instanceof OutsideRootError) return 403;
-  if (error instanceof TypeError || error instanceof URIError) return 400;
   return 500;
 }
 
@@ -58,7 +49,7 @@ function parse(value: string): unknown {
   }
 }
 
-function validate<T>(value: unknown, parser: (value: unknown) => T): T {
+function parseRequest<T>(value: unknown, parser: (value: unknown) => T): T {
   try {
     return parser(value);
   } catch (error) {
@@ -73,13 +64,21 @@ function upload(bytes: Uint8Array): { metadata: Record<string, unknown>; value: 
   const end = 4 + new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0);
   if (end > bytes.byteLength) throw new RequestError(400, 'Truncated save metadata');
   const metadata = parse(new TextDecoder().decode(bytes.subarray(4, end)));
-  if (typeof metadata !== 'object' || metadata === null || !('dependencies' in metadata) || !('hashes' in metadata) || !('saved' in metadata)) {
-    throw new RequestError(400, 'Expected dependencies, hashes, and saved dependencies');
+  if (typeof metadata !== 'object' || metadata === null || !('checked' in metadata) || !('expected' in metadata) || !('saved' in metadata)) {
+    throw new RequestError(400, 'Expected checked, expected, and saved');
   }
   return { metadata, value: bytes.subarray(end) };
 }
 
-function json(response: ServerResponse, value: unknown): void {
+/** The `dependencies` of a same-origin POST's JSON body. */
+async function posted(request: IncomingMessage): Promise<unknown> {
+  if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
+  const value = parse(new TextDecoder().decode(await body(request)));
+  if (typeof value !== 'object' || value === null || !('dependencies' in value)) throw new RequestError(400, 'Expected dependencies');
+  return value.dependencies;
+}
+
+function sendJson(response: ServerResponse, value: unknown): void {
   response.setHeader('Content-Type', 'application/json');
   response.end(JSON.stringify(value));
 }
@@ -88,30 +87,25 @@ async function respond(
   request: IncomingMessage,
   response: ServerResponse,
   name: string,
-  storage: Backend,
+  storage: Storage,
   server: ViteDevServer,
 ): Promise<void> {
   const root = server.config.root;
   response.setHeader('Cache-Control', 'no-store');
   if (name === '__vitecache' && request.method === 'GET') {
-    json(response, { vitecache: 1 });
+    sendJson(response, { vitecache: 1 });
     return;
   }
-  if ((name === '__vitecache/snapshot' || name === '__vitecache/resolve') && request.method === 'POST') {
-    if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
-    const value = parse(new TextDecoder().decode(await body(request)));
-    if (typeof value !== 'object' || value === null || !('dependencies' in value)) {
-      throw new RequestError(400, 'Expected dependencies');
-    }
-    if (name === '__vitecache/resolve') {
-      const deps = validate(value.dependencies, dependencies);
-      const origin = `${server.config.server.https ? 'https' : 'http'}://${request.headers.host}`;
-      json(response, { dependencies: await resolveDependencies(server, deps, origin) });
-      return;
-    }
-    const deps = validate(value.dependencies, resolvedDependencies);
+  if (name === '__vitecache/resolve' && request.method === 'POST') {
+    const deps = parseRequest(await posted(request), dependencies);
+    const origin = `${server.config.server.https ? 'https' : 'http'}://${request.headers.host}`;
+    sendJson(response, { dependencies: await resolveDependencies(server, deps, origin) });
+    return;
+  }
+  if (name === '__vitecache/snapshot' && request.method === 'POST') {
+    const deps = parseRequest(await posted(request), hashableDependencies);
     await confine(root, deps);
-    json(response, await storage.snapshot(deps));
+    sendJson(response, await storage.snapshot(deps));
     return;
   }
   if (!/^[a-f0-9]{64}\.bin$/.test(name)) {
@@ -123,38 +117,47 @@ async function respond(
   if (request.method === 'PUT') {
     if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
     const { metadata, value } = upload(await body(request));
-    const validation = validate(metadata.dependencies, resolvedDependencies);
-    const expected = validate(metadata.hashes, hashes);
-    const saved = validate(metadata.saved, (input) => resolvedDependencies(savedDependencies(input)));
-    await confine(root, validation);
+    const checked = parseRequest(metadata.checked, hashableDependencies);
+    const expected = parseRequest(metadata.expected, hashes);
+    const saved = parseRequest(metadata.saved, hashableDependencies);
+    await confine(root, checked);
     await confine(root, saved);
-    await storage.save(key, value, validation, expected, saved);
+    await storage.save(key, value, { checked, expected, saved });
     response.statusCode = 204;
     response.end();
     return;
   }
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
+  if (request.method !== 'GET') {
     response.statusCode = 405;
-    response.setHeader('Allow', 'GET, HEAD, PUT');
+    response.setHeader('Allow', 'GET, PUT');
     response.end();
     return;
   }
-  const stored = await storage.load(key, true);
+  const stored = await storage.load(key);
   if (stored === undefined) {
     // Browsers log every 404 fetch as an error, and a miss is an expected answer.
     response.statusCode = 204;
     response.end();
     return;
   }
+  // Browsers keep the bytes and revalidate them on every load, so an unchanged entry costs a 304 rather than a download.
+  response.setHeader('Cache-Control', 'no-cache');
+  const tag = `"${stored.tag}"`;
+  response.setHeader('ETag', tag);
+  response.setHeader('X-Vitecache-Dependencies', encodeURIComponent(JSON.stringify(stored.hashes)));
+  if (request.headers['if-none-match'] === tag) {
+    response.statusCode = 304;
+    response.end();
+    return;
+  }
   response.setHeader('Content-Type', 'application/octet-stream');
   response.setHeader('Content-Length', stored.bytes.byteLength);
-  response.setHeader('X-Vitecache-Dependencies', encodeURIComponent(JSON.stringify(stored.hashes)));
-  response.end(request.method === 'HEAD' ? undefined : stored.bytes);
+  response.end(stored.bytes);
 }
 
 /** Persist and validate entries in development; preserve asset URL mappings in production builds. */
 export function vitecache(options: VitecacheOptions = {}): Plugin {
-  let resolved: { backend: Backend; root: string; prefix: string; directory: string; config: ResolvedConfig; cachePath: string } | undefined;
+  let state: { storage: Storage; root: string; prefix: string; directory: string; config: ResolvedConfig; cachePath: string } | undefined;
   return {
     name: 'vitecache',
     enforce: 'post',
@@ -162,12 +165,12 @@ export function vitecache(options: VitecacheOptions = {}): Plugin {
       if (!config.publicDir) throw new Error('vitecache requires Vite publicDir');
       const { root, directory } = disk.location({ root: config.root, ...options });
       const path = relative(config.publicDir, directory);
-      if (!path || !inside(config.publicDir, directory)) {
+      if (!path || !disk.inside(config.publicDir, directory)) {
         throw new Error('vitecache basePath must be a directory inside Vite publicDir');
       }
       const base = new URL(config.base, 'http://vitecache').pathname.replace(/\/$/, '');
-      resolved = {
-        backend: createStorage({ root, ...options, memoizeHashes: config.command === 'serve' }),
+      state = {
+        storage: createStorage({ root, ...options }),
         root,
         directory,
         config,
@@ -177,37 +180,38 @@ export function vitecache(options: VitecacheOptions = {}): Plugin {
       await disk.ignore(root, directory);
     },
     async generateBundle(_options, bundle) {
-      const storage = resolved;
-      if (!storage) throw new Error('vitecache configuration was not resolved');
-      const paths = new Map(Object.entries(await publicPaths(storage.config, storage.directory)));
+      const resolved = state;
+      if (!resolved) throw new Error('vitecache configuration was not resolved');
+      const paths = new Map(Object.entries(await publicPaths(resolved.config, resolved.directory)));
       for (const asset of Object.values(bundle)) {
         if (asset.type !== 'asset') continue;
         const originals = [...new Set(asset.originalFileNames)];
         if (originals.length !== 1) continue;
         const original = originals[0];
         if (!original) continue;
-        const file = relative(storage.root, resolve(storage.root, original));
-        if (!inside(storage.root, resolve(storage.root, original))) continue;
-        paths.set(assetUrl(asset.fileName), file.split(sep).join('/'));
+        const file = resolve(resolved.root, original);
+        if (!disk.inside(resolved.root, file)) continue;
+        paths.set(assetUrl(asset.fileName), relative(resolved.root, file).split(sep).join('/'));
       }
-      const manifest = { paths: Object.fromEntries(paths), root: '../'.repeat(storage.cachePath.split('/').length + 1) };
-      this.emitFile({ type: 'asset', fileName: `${storage.cachePath}/__vitecache/paths.json`, source: JSON.stringify(manifest) });
+      const manifest = { paths: Object.fromEntries(paths), root: '../'.repeat(resolved.cachePath.split('/').length + 1) };
+      this.emitFile({ type: 'asset', fileName: `${resolved.cachePath}/__vitecache/paths.json`, source: JSON.stringify(manifest) });
     },
     configureServer(server) {
-      const storage = resolved;
-      if (!storage) throw new Error('vitecache configuration was not resolved');
+      const resolved = state;
+      if (!resolved) throw new Error('vitecache configuration was not resolved');
       server.middlewares.use((request, response, next) => {
         const path = new URL(request.url ?? '/', 'http://vitecache').pathname;
-        if (!path.startsWith(storage.prefix)) {
+        if (!path.startsWith(resolved.prefix)) {
           next();
           return;
         }
-        void respond(request, response, path.slice(storage.prefix.length), storage.backend, server).catch((error: unknown) => {
-          response.statusCode = status(error);
+        void respond(request, response, path.slice(resolved.prefix.length), resolved.storage, server).catch((error: unknown) => {
+          // A missing dependency is an expected answer, as in a snapshot: a body, and no error status for browsers to log.
           if (error instanceof MissingDependencyError) {
-            json(response, { error: 'missing-dependency', message: error.message });
+            sendJson(response, { status: 'missing', message: error.message });
             return;
           }
+          response.statusCode = status(error);
           response.setHeader('Content-Type', 'text/plain');
           response.end(error instanceof Error ? error.message : 'vitecache request failed');
         });

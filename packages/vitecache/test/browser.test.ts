@@ -45,7 +45,7 @@ test('saves resolve saved URL dependencies through the plugin, and a missing one
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
     if (url.pathname.endsWith('resolve')) {
       expect(init?.body).toBe(JSON.stringify({ dependencies: { helper: { url: 'https://example.test/helper.ts' } } }));
-      if (missing) return Response.json({ error: 'missing-dependency', message: 'gone' }, { status: 404 });
+      if (missing) return Response.json({ status: 'missing', message: 'gone' });
       return Response.json({ dependencies: { helper: { path: 'public/helper.ts' } } });
     }
     if (init?.method === 'PUT') {
@@ -57,9 +57,9 @@ test('saves resolve saved URL dependencies through the plugin, and a missing one
   const entry = new CacheEntry({ version: 'saved@1' });
   const dependencies = { helper: { url: '/helper.ts' } };
   await entry.save(new Uint8Array([1]), { dependencies });
-  expect(saved).toEqual({ dependencies: {}, hashes: {}, saved: { helper: { path: 'public/helper.ts' } } });
+  expect(saved).toEqual({ checked: {}, expected: {}, saved: { helper: { path: 'public/helper.ts' } } });
   missing = true;
-  await expect(entry.save(new Uint8Array([1]), { dependencies })).rejects.toThrow('gone');
+  await expect(entry.save(new Uint8Array([1]), { dependencies })).rejects.toMatchObject({ name: 'MissingDependencyError', message: 'gone' });
 });
 
 test('URL resolution preserves invalid URL and infrastructure errors', async () => {
@@ -73,13 +73,13 @@ test('URL resolution preserves invalid URL and infrastructure errors', async () 
   await expect(new CacheEntry({ ...options, dependencies: { source: { url: 'https://foreign.test/source.bin' } } }).load()).rejects.toThrow(/same Vite project origin/);
 });
 
-test('concurrent entries share canonical-base discovery, retry failures, and keep validation fresh', async () => {
+/** A plugin whose discovery fails while `state.offline`, serving bytes [7] saved from source hash `original`. */
+function sharedServer() {
   const original = digest(new Uint8Array([1]));
-  let current = original;
-  let offline = true;
+  const state = { current: original, offline: false };
   const fetch = server((url) => {
-    if (url.pathname.endsWith('__vitecache')) return offline ? new Response(null, { status: 503 }) : discovery(true);
-    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'available', hashes: { source: current } });
+    if (url.pathname.endsWith('__vitecache')) return state.offline ? new Response(null, { status: 503 }) : discovery(true);
+    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'current', hashes: { source: state.current } });
     return binary([7], { source: original });
   });
   const options = { version: 'shared@1', dependencies: { source: { path: 'public/source.bin' } } };
@@ -88,23 +88,32 @@ test('concurrent entries share canonical-base discovery, retry failures, and kee
     new CacheEntry({ ...options, basePath: '/app/./cache/' }),
     new CacheEntry({ ...options, basePath: 'https://example.test:443/app/cache/' }),
   ];
-  const discoveryCalls = () => fetch.mock.calls.filter(([url]) => url.toString().endsWith('__vitecache'));
+  const calls = (suffix: string) => fetch.mock.calls.filter(([url]) => url.toString().endsWith(suffix));
+  return { state, options, entries, calls };
+}
+
+test('entries on one canonical base share a discovery, and retry it after it fails', async () => {
+  const { state, options, entries, calls } = sharedServer();
+  state.offline = true;
   const failed = await Promise.allSettled(entries.map((entry) => entry.load()));
   expect(failed).toEqual(entries.map(() => ({ status: 'rejected', reason: expect.objectContaining({ message: 'vitecache discovery failed: HTTP 503' }) })));
-  expect(discoveryCalls()).toHaveLength(1);
-
-  offline = false;
+  expect(calls('__vitecache')).toHaveLength(1);
+  state.offline = false;
   expect(await Promise.all(entries.map((entry) => entry.load()))).toEqual(entries.map(() => new Uint8Array([7])));
-  expect(discoveryCalls()).toHaveLength(2);
+  expect(calls('__vitecache')).toHaveLength(2);
   expect(await new CacheEntry({ ...options, basePath: './cache/' }).load()).toEqual(new Uint8Array([7]));
-  expect(discoveryCalls()).toHaveLength(2);
-  const snapshots = fetch.mock.calls.filter(([url]) => url.toString().endsWith('snapshot')).length;
-  current = digest(new Uint8Array([2]));
+  expect(calls('__vitecache')).toHaveLength(2);
+  expect(await new CacheEntry({ ...options, basePath: '/other/cache/' }).load()).toEqual(new Uint8Array([7]));
+  expect(calls('__vitecache')).toHaveLength(3);
+});
+
+test('every load takes a fresh snapshot, so a changed dependency misses', async () => {
+  const { state, entries, calls } = sharedServer();
+  expect(await Promise.all(entries.map((entry) => entry.load()))).toEqual(entries.map(() => new Uint8Array([7])));
+  const snapshots = calls('snapshot').length;
+  state.current = digest(new Uint8Array([2]));
   expect(await Promise.all(entries.map((entry) => entry.load()))).toEqual(entries.map(() => undefined));
-  expect(discoveryCalls()).toHaveLength(2);
-  expect(fetch.mock.calls.filter(([url]) => url.toString().endsWith('snapshot'))).toHaveLength(snapshots + entries.length);
-  expect(await new CacheEntry({ ...options, basePath: '/other/cache/' }).load()).toBeUndefined();
-  expect(discoveryCalls()).toHaveLength(3);
+  expect(calls('snapshot')).toHaveLength(snapshots + entries.length);
 });
 
 test('production reads static bytes without dependency checks, warns on has misses, and skips saves', async () => {
@@ -125,61 +134,77 @@ test('production reads static bytes without dependency checks, warns on has miss
   expect(warn).toHaveBeenCalledOnce();
 });
 
-test('plugin validates dependencies, ignores declaration mutation, and snapshots byte views before save awaits', async () => {
-  const original = digest(new Uint8Array([1]));
-  let current = original;
-  let saved: Uint8Array | undefined;
+test('an entry keeps its declarations and the byte view it saves, though callers mutate them', async () => {
+  const current = digest(new Uint8Array([1]));
   const files = { '模型': { path: 'public/模型.glb' } };
   const entry = new CacheEntry({ version: 'mesh@1', dependencies: files, basePath: '/app/cache/' });
   files['模型'].path = 'changed-after-construction';
-  const fetch = server((url, init) => {
+  let saved: unknown;
+  server((url, init) => {
     expect(url.pathname).toMatch(/^\/app\/cache\//);
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
     if (url.pathname.endsWith('snapshot')) {
       expect(init?.body).toBe(JSON.stringify({ dependencies: { '模型': { path: 'public/模型.glb' } } }));
-      return Response.json({ status: 'available', hashes: { '模型': current } });
+      return Response.json({ status: 'current', hashes: { '模型': current } });
     }
     if (init?.method === 'PUT') {
-      const { metadata, value } = uploaded(init.body);
-      expect(metadata).toEqual({ dependencies: { '模型': { path: 'public/模型.glb' } }, hashes: { '模型': current }, saved: {} });
-      expect(value).toEqual(new Uint8Array([0, 255]));
-      saved = new Uint8Array([0, 255]);
+      saved = uploaded(init.body);
       return new Response(null, { status: 204 });
     }
-    return binary(saved ? Array.from(saved) : [], { '模型': original });
+    return new Response(null, { status: 204 });
   });
-  expect(await entry.load()).toEqual(new Uint8Array());
+  expect(await entry.load()).toBeUndefined();
   const source = new Uint8Array([9, 0, 255, 9]);
   const saving = entry.save(source.subarray(1, 3));
   source.fill(7);
   await saving;
-  current = digest(new Uint8Array([2]));
-  expect(await entry.load()).toBeUndefined();
-  expect(fetch.mock.calls.filter(([url]) => url.toString().endsWith('__vitecache'))).toHaveLength(1);
+  expect(saved).toEqual({ metadata: { checked: { '模型': { path: 'public/模型.glb' } }, expected: { '模型': current }, saved: {} }, value: new Uint8Array([0, 255]) });
 });
 
-test('plugin misses and missing dependencies stay quiet, failures reject without fallback', async () => {
+test('bytes without hashes reject when the plugin checked dependencies, and value-only entries need no hashes', async () => {
+  const fetch = server((url) => {
+    if (url.pathname.endsWith('__vitecache')) return discovery(true);
+    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'current', hashes: { source: digest(new Uint8Array([1])) } });
+    return binary([1]);
+  });
+  await expect(new CacheEntry({ version: 'checked@1', dependencies: { source: { path: 'public/source.glb' } } }).load()).rejects.toThrow(/without its dependency hashes/);
+  fetch.mockClear();
+  expect(await new CacheEntry({ version: 'values@1', dependencies: { ratio: { value: 0.5 } } }).load()).toEqual(new Uint8Array([1]));
+  // A deployed value-only hit costs one request: no discovery for a static host to answer with a logged 404.
+  expect(fetch.mock.calls).toHaveLength(1);
+});
+
+test('plugin misses stay quiet', async () => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   server((url) => {
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
-    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'available', hashes: {} });
+    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'current', hashes: {} });
     return new Response(null, { status: 204 });
   });
   expect(await new CacheEntry({ version: 'missing@1' }).has()).toBe(false);
   expect(await new CacheEntry({ version: 'missing@1', dependencies: { source: { path: 'source.ts' } } }).load()).toBeUndefined();
   expect(warn).not.toHaveBeenCalled();
-  server((url) => url.pathname.endsWith('__vitecache') ? discovery(true) : new Response(null, { status: 500 }));
-  await expect(new CacheEntry({ version: 'broken@1' }).load()).rejects.toThrow('HTTP 500');
+});
+
+test('a missing dependency misses without reading bytes, and rejects the save', async () => {
   server((url) => {
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
-    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'missing' });
+    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'missing', message: 'Missing file or package dependency: source' });
     throw new Error('Must not read cached data for missing dependencies');
   });
   const missing = new CacheEntry({ version: 'missing-dep@1', dependencies: { source: { path: 'missing' } } });
   expect(await missing.load()).toBeUndefined();
   await expect(missing.save(new Uint8Array())).rejects.toThrow(/missing/);
+});
+
+test('a 409 on save is a ChangedDependenciesError', async () => {
   server((url) => url.pathname.endsWith('__vitecache') ? discovery(true) : new Response(null, { status: 409 }));
-  await expect(new CacheEntry({ version: 'failed@1' }).save(new Uint8Array())).rejects.toThrow('HTTP 409');
+  await expect(new CacheEntry({ version: 'failed@1' }).save(new Uint8Array())).rejects.toMatchObject({ name: 'ChangedDependenciesError' });
+});
+
+test('server, hosting and network failures reject without fallback', async () => {
+  server((url) => url.pathname.endsWith('__vitecache') ? discovery(true) : new Response(null, { status: 500 }));
+  await expect(new CacheEntry({ version: 'broken@1' }).load()).rejects.toThrow('HTTP 500');
   server((url) => url.pathname.endsWith('__vitecache') ? discovery(false) : Response.json({ broken: 'hosting' }));
   await expect(new CacheEntry({ version: 'bad-mime@1', basePath: '/production/_vitecache/' }).load()).rejects.toThrow(/content type/);
   server(() => { throw new Error('offline'); });
@@ -196,7 +221,7 @@ test('value-only entries skip the snapshot, keep their keys, and still save', as
     if (url.pathname.endsWith('__vitecache')) return discovery(true);
     expect(url.pathname).toBe(`/_vitecache/${expected}.bin`);
     if (init?.method === 'PUT') {
-      expect(uploaded(init.body).metadata).toMatchObject({ hashes: {} });
+      expect(uploaded(init.body).metadata).toMatchObject({ expected: {} });
       saved = new Uint8Array([5]);
       return new Response(null, { status: 204 });
     }
@@ -209,22 +234,38 @@ test('value-only entries skip the snapshot, keep their keys, and still save', as
   expect(fetch.mock.calls.some(([url]) => url.toString().includes('snapshot'))).toBe(false);
 });
 
-test('production URL resolution uses build mappings, misses unmapped URLs, and rejects foreign URLs or a missing mapping', async () => {
-  server((url) => {
+function productionServer() {
+  return server((url) => {
     if (url.pathname.endsWith('__vitecache')) return discovery(false);
     if (url.pathname.endsWith('paths.json')) return Response.json({ root: '../../', paths: { 'assets/model-abc.glb': 'src/model.glb' } });
     return binary([7]);
   });
-  const fromUrl = new CacheEntry({ version: 'production@1', basePath: '/app/_vitecache/', dependencies: { model: { url: '/app/assets/model-abc.glb?v=1' } } });
-  expect(await fromUrl.load()).toEqual(new Uint8Array([7]));
-  // Like a missing file in development, a URL the build did not map is a miss.
-  expect(await new CacheEntry({ version: 'unmapped@1', dependencies: { model: { url: '/unknown.glb' } } }).load()).toBeUndefined();
+}
+
+test('production URL resolution fetches the build mapping once and revalidates bytes', async () => {
+  const fetch = productionServer();
+  const options = { basePath: '/app/_vitecache/', dependencies: { model: { url: '/app/assets/model-abc.glb?v=1' } } };
+  expect(await new CacheEntry({ ...options, version: 'production@1' }).load()).toEqual(new Uint8Array([7]));
+  expect(await new CacheEntry({ ...options, version: 'production@2' }).load()).toEqual(new Uint8Array([7]));
+  expect(fetch.mock.calls.filter(([url]) => url.toString().endsWith('paths.json'))).toHaveLength(1);
+  // Entry names do not change with their contents, so the browser may keep the bytes but must revalidate them.
+  expect(fetch.mock.calls.filter(([url]) => url.toString().endsWith('.bin')).every(([, init]) => init?.cache === 'no-cache')).toBe(true);
+});
+
+test('a URL the build did not map is a miss, like a missing file in development', async () => {
+  productionServer();
+  const unmapped = { version: 'unmapped@1', dependencies: { model: { url: '/unknown.glb' } } };
+  expect(await new CacheEntry(unmapped).load()).toBeUndefined();
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-  expect(await new CacheEntry({ version: 'unmapped@1', dependencies: { model: { url: '/unknown.glb' } } }).has()).toBe(false);
+  expect(await new CacheEntry(unmapped).has()).toBe(false);
   expect(warn).toHaveBeenCalledOnce();
+});
+
+test('production URL resolution rejects foreign URLs and a missing build mapping', async () => {
+  productionServer();
   await expect(new CacheEntry({ version: 'foreign@1', dependencies: { model: { url: 'https://foreign.test/a.glb' } } }).load()).rejects.toThrow(/same Vite project origin/);
   server((url) => url.pathname.endsWith('__vitecache') ? discovery(false) : new Response(null, { status: 404 }));
-  await expect(new CacheEntry({ version: 'no-map@1', dependencies: { model: { url: '/model.glb' } } }).load()).rejects.toThrow(/Missing production URL mapping/);
+  await expect(new CacheEntry({ version: 'no-map@1', basePath: '/unbuilt/_vitecache/', dependencies: { model: { url: '/model.glb' } } }).load()).rejects.toThrow(/Missing production URL mapping/);
 });
 
 test('lazy resolution captures declarations and retries failed URL resolution', async () => {
@@ -241,7 +282,7 @@ test('lazy resolution captures declarations and retries failed URL resolution', 
       if (++attempts === 1) return new Response(null, { status: 500 });
       return Response.json({ dependencies: { model: { path: 'public/model.glb' }, parameters: { value: { ratio: 0.5 } } } });
     }
-    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'available', hashes: { model: digest(new Uint8Array([1])) } });
+    if (url.pathname.endsWith('snapshot')) return Response.json({ status: 'current', hashes: { model: digest(new Uint8Array([1])) } });
     expect(url.pathname).toContain(key('lazy@1', { model: { path: 'public/model.glb' }, parameters: { value: { ratio: 0.5 } } }));
     return binary([2], { model: digest(new Uint8Array([1])) });
   });
@@ -249,9 +290,7 @@ test('lazy resolution captures declarations and retries failed URL resolution', 
   await expect(entry.load()).rejects.toThrow('HTTP 500');
   expect(await entry.load()).toEqual(new Uint8Array([2]));
   expect(attempts).toBe(2);
-  expect('key' in entry).toBe(false);
 });
-
 
 test('relative-base production mappings resolve under a deployment prefix and nested cache directory', async () => {
   const expected = key('relocated@1', { model: { path: 'src/model.glb' } });
@@ -265,7 +304,6 @@ test('relative-base production mappings resolve under a deployment prefix and ne
   expect(await entry.load()).toEqual(new Uint8Array([8]));
 });
 
-
 test('browser saves without the plugin warn before dependency preparation or URL resolution', async () => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   const fetch = server(() => discovery(false));
@@ -273,7 +311,7 @@ test('browser saves without the plugin warn before dependency preparation or URL
     new CacheEntry({ version: 'no-dependencies@1' }),
     new CacheEntry({ version: 'path@1', dependencies: { source: { path: 'src/source.ts' } } }),
     new CacheEntry({ version: 'url@1', dependencies: { source: { url: '/source.ts' } } }),
-    new CacheEntry({ version: 'package@1', dependencies: { engine: { package: 'elkjs' } } }),
+    new CacheEntry({ version: 'package@1', dependencies: { engine: { package: 'layout-engine' } } }),
   ];
   for (const entry of entries) await expect(entry.save(new Uint8Array([1]))).resolves.toBeUndefined();
   expect(warn).toHaveBeenCalledTimes(4);

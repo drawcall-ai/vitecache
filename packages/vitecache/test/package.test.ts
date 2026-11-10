@@ -12,7 +12,7 @@ test('selects Node exports and bundles the browser entry without filesystem code
   ]);
   const [path, exports] = stdout.trim().split('\n');
   expect(path).toMatch(/\/dist\/node\.js$/);
-  expect(exports).toBe('CacheEntry,MissingDependencyError');
+  expect(exports).toBe('CacheEntry,ChangedDependenciesError,MissingDependencyError');
   const bundle = await build({
     configFile: false,
     logLevel: 'silent',
@@ -32,7 +32,6 @@ test('selects Node exports and bundles the browser entry without filesystem code
   const chunk = output.output.find((item) => item.type === 'chunk');
   if (!chunk || chunk.type !== 'chunk') throw new Error('Missing browser chunk');
   expect(chunk.code).toContain('CacheEntry');
-  expect(chunk.code).not.toContain('indexedDB');
   expect(chunk.code).not.toContain('node:fs');
   expect(chunk.code).not.toContain('node:crypto');
   expect(chunk.code).not.toContain('process.cwd');

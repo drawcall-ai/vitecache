@@ -29,11 +29,7 @@ if (bytes === undefined) {
 useMeshBytes(bytes)
 ```
 
-Entries identify computations by version and named dependencies: JSON `{ value }`, file `{ path }` or `{ url }`, and installed library `{ package: "elkjs" }`. Node and the Vite development plugin validate file contents and package versions without changing entry keys.
-
-Paths are always relative to the project root: `root` in Node (the working directory by default), or the Vite project root in browsers. The Vite plugin resolves served URLs to their source paths and preserves mappings for public files and emitted assets in production builds; Node accepts local file URLs.
-
-Package installation paths are excluded from identity; transitive packages need their own declarations. Load before computing so saving can detect dependencies that changed during computation.
+Entries identify computations by version and named dependencies: JSON `{ value }`, file `{ path }` or `{ url }`, and installed library `{ package: "layout-engine" }`. Node and the Vite development plugin validate file contents and package versions without changing entry keys.
 
 Node reads and writes `<project_root>/public/_vitecache/`. Add the plugin to save browser results into the same directory during development:
 
@@ -44,6 +40,6 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-Node saves and the plugin add the cache directory to `.gitignore`. Generate caches before building and include them in your deployment. Browsers without the plugin read public cache files, assume dependencies unchanged, and warn and skip writes when `save()` is called.
+Node saves and the plugin add the cache directory to `.gitignore`. Generate caches before building and include them in your deployment; `prune` from `vitecache/prune` removes entries no load or save has used since a given time. Browsers without the plugin read public cache files, assume dependencies unchanged, and warn and skip writes when `save()` is called.
 
 For usage patterns, see the [vitecache skill](skills/vitecache/SKILL.md), also shipped in this package.

@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { relative, resolve, sep } from 'node:path';
 import type { ResolvedConfig } from 'vite';
-import { inside } from './resolve.js';
+import * as disk from '../disk.js';
 
 export function assetUrl(file: string): string {
   return file.split('/').map(encodeURIComponent).join('/');
@@ -14,12 +14,12 @@ export async function publicPaths(config: ResolvedConfig, cacheDirectory: string
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+      if (disk.notFound(error)) return;
       throw error;
     }
     for (const entry of entries) {
       const file = resolve(directory, entry.name);
-      if (inside(cacheDirectory, file)) continue;
+      if (disk.inside(cacheDirectory, file)) continue;
       if (entry.isDirectory()) await visit(file);
       else if (entry.isFile()) {
         const publicPath = relative(config.publicDir, file).split(sep).join('/');

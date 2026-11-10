@@ -1,20 +1,29 @@
-import type { Dependencies, Dependency, Hashes, JsonValue, Paths, ResolvedDependencies, ResolvedDependency, SavedDependencies, SavedDependency } from './types.js';
+import type { Checked, Dependencies, Dependency, Hashable, Hashes, JsonValue, Paths, Resolved, SavedDependencies } from './types.js';
 
 /** A file or package dependency has no backing file or installation, so its state cannot be checked. */
 export class MissingDependencyError extends Error {
   override name = 'MissingDependencyError';
 }
 
-export function record(value: unknown): Record<string, unknown> {
+/** A file or package dependency changed between load() and save(), so the result may be built from stale inputs. */
+export class ChangedDependenciesError extends Error {
+  override name = 'ChangedDependenciesError';
+  constructor() {
+    super('vitecache dependencies changed during computation.');
+  }
+}
+
+/** A plain object of named entries, sorted by name: dependencies, their values, paths or hashes. */
+function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new TypeError('Expected a named dependency record.');
+    throw new TypeError('Expected an object of named entries.');
   }
   const prototype: unknown = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Expected a plain dependency record.');
-  if (Object.getOwnPropertySymbols(value).length) throw new TypeError('Dependency names must be strings.');
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Expected a plain object of named entries.');
+  if (Object.getOwnPropertySymbols(value).length) throw new TypeError('Entry names must be strings.');
   return Object.fromEntries(Object.keys(value).sort().map((name) => {
     const property = Object.getOwnPropertyDescriptor(value, name);
-    if (!property || !('value' in property)) throw new TypeError('Dependency getters are not supported.');
+    if (!property || !('value' in property)) throw new TypeError('Getters are not supported.');
     const item: unknown = property.value;
     return [name, item];
   }));
@@ -87,21 +96,34 @@ export function dependencies(value: unknown): Dependencies {
   return Object.freeze(Object.fromEntries(entries));
 }
 
-export function resolvedDependencies(value: unknown): ResolvedDependencies {
-  const entries = Object.entries(dependencies(value)).map(([name, dependency]): [string, ResolvedDependency] => {
-    if (dependency.url !== undefined) throw new TypeError('Expected resolved dependencies, not URLs.');
-    return [name, dependency];
-  });
-  return Object.freeze(Object.fromEntries(entries));
+function only<D extends Dependency, K extends D>(value: Dependencies<D>, keep: (dependency: D) => dependency is K, message: string): Dependencies<K> {
+  return Object.freeze(Object.fromEntries(Object.entries(value).map(([name, dependency]) => {
+    if (!keep(dependency)) throw new TypeError(message);
+    return [name, dependency] as const;
+  })));
+}
+
+function isResolved<D extends Dependency>(dependency: D): dependency is Resolved<D> {
+  return dependency.url === undefined;
+}
+
+export function isChecked<D extends Dependency>(dependency: D): dependency is Checked<D> {
+  return dependency.value === undefined;
+}
+
+/** Dependencies after resolution, which turns URLs into paths. */
+export function resolvedDependencies(value: unknown): Dependencies<Resolved> {
+  return only(dependencies(value), isResolved, 'Expected resolved dependencies, not URLs.');
 }
 
 /** Saved dependencies are rechecked later, so they cannot be values: values select the result and belong to the key. */
 export function savedDependencies(value: unknown): SavedDependencies {
-  const entries = Object.entries(dependencies(value)).map(([name, dependency]): [string, SavedDependency] => {
-    if (dependency.value !== undefined) throw new TypeError('Saved dependencies cannot be values: values select the result; pass them to the constructor.');
-    return [name, dependency];
-  });
-  return Object.freeze(Object.fromEntries(entries));
+  return only(dependencies(value), isChecked, 'Saved dependencies cannot be values: values select the result; pass them to the constructor.');
+}
+
+/** Resolved file and package dependencies: the ones whose current state can be hashed. */
+export function hashableDependencies(value: unknown): Dependencies<Hashable> {
+  return only(dependencies(value), (dependency): dependency is Hashable => isChecked(dependency) && isResolved(dependency), 'Expected file paths and packages, not values or URLs.');
 }
 
 export function hashes(value: unknown): Hashes {

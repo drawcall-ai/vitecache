@@ -1,6 +1,6 @@
 {
   "name": "vitecache",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Persistent binary caching for expensive computation in browsers and Node.",
   "type": "module",
   "license": "MIT",
@@ -30,6 +30,10 @@
       "browser": "./dist/browser.js",
       "node": "./dist/node.js",
       "default": "./dist/browser.js"
+    },
+    "./prune": {
+      "types": "./dist/prune.d.ts",
+      "default": "./dist/prune.js"
     },
     "./vite": {
       "types": "./dist/vite/index.d.ts",

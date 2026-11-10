@@ -1,13 +1,25 @@
-import { hashes, MissingDependencyError, paths, record, resolvedDependencies } from './dependencies.js';
+import { ChangedDependenciesError, hashes, MissingDependencyError, paths, resolvedDependencies } from './dependencies.js';
 import { Entry } from './entry.js';
-import type { Backend, CacheEntryOptions, Dependency, ResolvedDependency } from './types.js';
-export { MissingDependencyError } from './dependencies.js';
+import type { Backend, CacheEntryOptions, Dependency, Paths, Resolved } from './types.js';
+export { ChangedDependenciesError, MissingDependencyError } from './dependencies.js';
 export type { CacheEntryOptions, Dependency, Dependencies, JsonValue, SavedDependencies, SavedDependency, SaveOptions } from './types.js';
+
+/** Shares one request per URL across the page, and retries after a failure. */
+function memoize<T>(cache: Map<string, Promise<T>>, url: URL, request: (url: URL) => Promise<T>): Promise<T> {
+  const existing = cache.get(url.href);
+  if (existing) return existing;
+  const pending = request(url).catch((error: unknown) => {
+    cache.delete(url.href);
+    throw error;
+  });
+  cache.set(url.href, pending);
+  return pending;
+}
 
 const discoveries = new Map<string, Promise<boolean>>();
 
-async function discover(base: URL): Promise<boolean> {
-  const response = await fetch(new URL('__vitecache', base), { cache: 'no-store' });
+async function discover(url: URL): Promise<boolean> {
+  const response = await fetch(url, { cache: 'no-store' });
   if (response.status === 404) return false;
   if (!response.ok) throw new Error(`vitecache discovery failed: HTTP ${response.status}`);
   // Static SPA servers may return index.html for unknown paths.
@@ -16,24 +28,33 @@ async function discover(base: URL): Promise<boolean> {
   return typeof data === 'object' && data !== null && 'vitecache' in data && data.vitecache === 1;
 }
 
-function discovery(base: URL): Promise<boolean> {
-  const existing = discoveries.get(base.href);
-  if (existing) return existing;
-  const pending = discover(base).catch((error: unknown) => {
-    discoveries.delete(base.href);
-    throw error;
-  });
-  discoveries.set(base.href, pending);
-  return pending;
+const mappings = new Map<string, Promise<Paths>>();
+
+/** The production build's served pathnames mapped to project-root-relative source paths. */
+async function mapping(url: URL): Promise<Paths> {
+  const response = await fetch(url, { cache: 'no-cache' });
+  if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) {
+    throw new Error('URL dependencies require the vitecache Vite plugin during development and build. Missing production URL mapping.');
+  }
+  const data: unknown = await response.json();
+  const manifest = responseObject(data);
+  const mapped = paths(manifest.paths);
+  if (typeof manifest.root !== 'string' || !/^(?:\.\.\/)+$/.test(manifest.root)) throw new Error('Invalid vitecache production mapping root.');
+  const projectRoot = new URL(manifest.root, url);
+  return Object.fromEntries(Object.entries(mapped).map(([served, path]) => [new URL(served, projectRoot).pathname, path]));
 }
 
-/** The plugin answers a missing file or package dependency with 404 and a JSON reason. */
-async function rejectMissing(response: Response): Promise<void> {
-  if (response.status !== 404 || !response.headers.get('content-type')?.includes('application/json')) return;
-  const error: unknown = await response.json();
-  if (typeof error === 'object' && error !== null && 'error' in error && error.error === 'missing-dependency' && 'message' in error && typeof error.message === 'string') {
-    throw new MissingDependencyError(error.message);
-  }
+/** A JSON object that the plugin or a build answered with. */
+function responseObject(data: unknown): Record<string, unknown> {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) throw new TypeError('Invalid vitecache response.');
+  return Object.fromEntries(Object.entries(data));
+}
+
+/** The plugin answers a missing file or package dependency with `{ status: 'missing', message }` on every route. */
+function missingMessage(data: Record<string, unknown>): string | undefined {
+  if (data.status !== 'missing') return undefined;
+  if (typeof data.message !== 'string') throw new TypeError('Invalid vitecache missing dependency response.');
+  return data.message;
 }
 
 function createBackend(options: CacheEntryOptions): Backend {
@@ -43,13 +64,13 @@ function createBackend(options: CacheEntryOptions): Backend {
   base.hash = '';
 
   function plugin(): Promise<boolean> {
-    return discovery(base);
+    return memoize(discoveries, new URL('__vitecache', base), discover);
   }
 
   return {
     canSave: plugin,
-    async resolve(dependencies) {
-      const locators = Object.entries(dependencies).map(([name, locator]): [string, Dependency] => {
+    async resolve(declared) {
+      const locators = Object.entries(declared).map(([name, locator]): [string, Dependency] => {
         if (locator.url === undefined) return [name, locator];
         const url = new URL(locator.url, globalThis.location.href);
         if (url.origin !== new URL(globalThis.location.href).origin) throw new Error('URL dependencies must be served by the same Vite project origin.');
@@ -65,27 +86,18 @@ function createBackend(options: CacheEntryOptions): Backend {
           body: JSON.stringify({ dependencies: Object.fromEntries(locators) }),
           cache: 'no-store',
         });
-        await rejectMissing(response);
-        if (!response.ok) throw new Error(`vitecache URL resolution failed: HTTP ${response.status}`);
-        const data: unknown = await response.json();
-        const resolved = resolvedDependencies(record(data).dependencies);
+        if (!response.ok) throw new Error(`vitecache URL resolution failed: HTTP ${response.status}: ${await response.text()}`);
+        const data = responseObject(await response.json());
+        const missing = missingMessage(data);
+        if (missing !== undefined) throw new MissingDependencyError(missing);
+        const resolved = resolvedDependencies(data.dependencies);
         if (Object.keys(resolved).length !== locators.length || !locators.every(([name]) => Object.hasOwn(resolved, name))) {
           throw new Error('Invalid vitecache resolved dependencies.');
         }
         return resolved;
       }
-      const manifestUrl = new URL('__vitecache/paths.json', base);
-      const response = await fetch(manifestUrl, { cache: 'no-store' });
-      if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) {
-        throw new Error('URL dependencies require the vitecache Vite plugin during development and build. Missing production URL mapping.');
-      }
-      const data: unknown = await response.json();
-      const manifest = record(data);
-      const mapping = paths(manifest.paths);
-      if (typeof manifest.root !== 'string' || !/^(?:\.\.\/)+$/.test(manifest.root)) throw new Error('Invalid vitecache production mapping root.');
-      const projectRoot = new URL(manifest.root, manifestUrl);
-      const mapped = Object.fromEntries(Object.entries(mapping).map(([url, path]) => [new URL(url, projectRoot).pathname, path]));
-      const resolved = locators.map(([name, locator]): [string, ResolvedDependency] => {
+      const mapped = await memoize(mappings, new URL('__vitecache/paths.json', base), mapping);
+      const resolved = locators.map(([name, locator]): [string, Resolved] => {
         if (locator.url === undefined) return [name, locator];
         const pathname = new URL(locator.url).pathname;
         const path = mapped[pathname];
@@ -96,23 +108,23 @@ function createBackend(options: CacheEntryOptions): Backend {
       return resolvedDependencies(Object.fromEntries(resolved));
     },
     async snapshot(dependencies) {
-      if (!await plugin()) return { status: 'unavailable' };
+      if (!await plugin()) return { status: 'unchecked' };
       const response = await fetch(new URL('__vitecache/snapshot', base), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dependencies }),
         cache: 'no-store',
       });
-      if (!response.ok) throw new Error(`vitecache dependency validation failed: HTTP ${response.status}`);
-      const data: unknown = await response.json();
-      if (typeof data === 'object' && data !== null && 'status' in data && data.status === 'missing') return { status: 'missing' };
-      if (typeof data !== 'object' || data === null || !('status' in data) || data.status !== 'available' || !('hashes' in data)) {
-        throw new TypeError('Invalid vitecache dependency response.');
-      }
-      return { status: 'available', hashes: hashes(data.hashes) };
+      if (!response.ok) throw new Error(`vitecache dependency validation failed: HTTP ${response.status}: ${await response.text()}`);
+      const data = responseObject(await response.json());
+      const missing = missingMessage(data);
+      if (missing !== undefined) return { status: 'missing', message: missing };
+      if (data.status !== 'current') throw new TypeError('Invalid vitecache dependency response.');
+      return { status: 'current', hashes: hashes(data.hashes) };
     },
-    async load(key, validate) {
-      const response = await fetch(new URL(`${key}.bin`, base), { cache: 'no-store' });
+    async load(key) {
+      // Entry names do not change with their contents, so cached bytes are revalidated before each use.
+      const response = await fetch(new URL(`${key}.bin`, base), { cache: 'no-cache' });
       // The plugin answers misses with 204 so they stay out of the console; static hosts answer 404.
       if (response.status === 204 || response.status === 404) return undefined;
       if (!response.ok) throw new Error(`vitecache load failed: HTTP ${response.status}`);
@@ -120,15 +132,15 @@ function createBackend(options: CacheEntryOptions): Backend {
       if (contentType === 'text/html') return undefined;
       if (contentType !== 'application/octet-stream') throw new Error(`Unexpected vitecache content type: ${contentType ?? 'missing'}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
-      if (!validate) return { bytes };
+      // Only the plugin sends hashes.
       const header = response.headers.get('X-Vitecache-Dependencies');
-      if (header === null) throw new Error('Missing vitecache dependency metadata.');
+      if (header === null) return { bytes };
       const value: unknown = JSON.parse(decodeURIComponent(header));
       return { bytes, hashes: hashes(value) };
     },
-    async save(key, value, validation, expected, saved) {
+    async save(key, value, { checked, expected, saved }) {
       // Metadata travels in the body: headers are capped near 16 KiB, and saved dependencies can be many.
-      const metadata = new TextEncoder().encode(JSON.stringify({ dependencies: validation, hashes: expected, saved }));
+      const metadata = new TextEncoder().encode(JSON.stringify({ checked, expected, saved }));
       const body = new Uint8Array(4 + metadata.byteLength + value.byteLength);
       new DataView(body.buffer).setUint32(0, metadata.byteLength);
       body.set(metadata, 4);
@@ -138,8 +150,12 @@ function createBackend(options: CacheEntryOptions): Backend {
         headers: { 'Content-Type': 'application/octet-stream' },
         body,
       });
-      await rejectMissing(response);
-      if (!response.ok) throw new Error(`vitecache save failed: HTTP ${response.status}`);
+      if (response.status === 409) throw new ChangedDependenciesError();
+      if (!response.ok) throw new Error(`vitecache save failed: HTTP ${response.status}: ${await response.text()}`);
+      if (response.status === 204) return;
+      const missing = missingMessage(responseObject(await response.json()));
+      if (missing === undefined) throw new TypeError('Invalid vitecache save response.');
+      throw new MissingDependencyError(missing);
     },
   };
 }
