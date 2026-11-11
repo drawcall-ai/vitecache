@@ -14,7 +14,8 @@ afterEach(async () => {
 
 /**
  * A project whose page runs `main`, with a cached loader that saves its arguments and the contents of input.txt, and
- * logs each run outside the watched files, and one that saves the URL it loads, resolved against its path.
+ * logs each run outside the watched files, and one that saves the URL it loads, resolved against its path, with that
+ * public file as an input.
  */
 async function project(main: string, version = "'echo@1'", options = ''): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
@@ -48,14 +49,15 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
   await writeFile(
     join(root, 'src/located.js'),
     `
-    import { CacheEntry } from ${JSON.stringify(resolve('src/node.ts'))};
+    import { CacheEntry, publicURL } from ${JSON.stringify(resolve('src/node.ts'))};
     export class CachedLocatedLoader {
       setPath(path) { this.path = path; }
       async loadAsync(url) {
         const resolved = new URL(url, new URL(this.path, 'http://host')).pathname;
         const entry = new CacheEntry({ version: 'located@1', dependencies: { url: { value: resolved } } });
         if (await entry.load()) return;
-        await entry.save(new TextEncoder().encode(resolved));
+        // Saving fails unless publicURL found the file below the plugin's publicDir.
+        await entry.save(new TextEncoder().encode(resolved), { dependencies: [{ path: publicURL(resolved) }] });
       }
     }`,
   );
@@ -106,6 +108,8 @@ test.each(['/', '/app/', './'])("a build with base %s warms public scripts, sett
   const root = await project('');
   await mkdir(join(root, 'public/tree'), { recursive: true });
   await writeFile(join(root, 'public/tree/index.glts'), script(locatedImport));
+  await writeFile(join(root, 'public/tree/model.glts'), '');
+  await writeFile(join(root, 'public/helper.bin'), '');
   await writeFile(
     join(root, 'public/tree/helper.js'),
     "import { CachedLocatedLoader as L } from '../../src/located.js'; new L().loadAsync('../helper.bin');",
@@ -188,6 +192,7 @@ test('the dev server scans a public script added while it runs', async () => {
   servers.push(server);
   await server.listen();
   await mkdir(join(root, 'public/tree'), { recursive: true });
+  await writeFile(join(root, 'public/tree/model.glts'), '');
   await writeFile(join(root, 'public/tree/index.glts'), script(locatedImport));
   const entry = `${server.resolvedUrls?.local[0]}_vitecache/${located('/tree/model.glts')}.bin`;
   await vi.waitFor(async () => expect(await (await fetch(entry)).text()).toBe('/tree/model.glts'));

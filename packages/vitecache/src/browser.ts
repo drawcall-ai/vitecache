@@ -1,4 +1,5 @@
 import { key, type CacheEntryOptions, type SaveOptions } from './entry.js';
+export { publicURL } from './shared.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
 const warned = new Set<string>();

@@ -4,7 +4,10 @@ import { configure } from 'safe-stable-stringify';
 
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-/** A file, relative to the project root, or an installed package, whose current state an entry is checked against. */
+/**
+ * A file, relative to the project root or as a `file:` URL, or an installed package, whose current state an entry is
+ * checked against.
+ */
 export type Input = { readonly path: string } | { readonly package: string };
 
 /** A JSON value selects which result an entry holds; an input invalidates it when it changes. */

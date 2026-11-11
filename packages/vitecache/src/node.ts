@@ -2,10 +2,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
 import { missing, read } from './disk.js';
 import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
-import { shared } from './shared.js';
+import { project, shared } from './shared.js';
+export { publicURL } from './shared.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
 /** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
@@ -63,9 +65,14 @@ export class CacheEntry {
     this.#key = key(options);
     const dependencies = Object.values(options.dependencies ?? {});
     this.#inputs = dependencies.filter((dependency): dependency is Input => !('value' in dependency));
-    this.#root = resolve(options.root ?? shared.root ?? process.cwd());
-    const plugin = options.root === undefined ? shared.directory : undefined;
-    this.#directory = plugin ?? join(this.#root, 'public/_vitecache');
+    const { root, publicDir } = project(options.root);
+    this.#root = resolve(root);
+    this.#directory = resolve(publicDir, '_vitecache');
+  }
+
+  /** An input's file, named by a `file:` URL or a path relative to the root. */
+  #file(path: string): string {
+    return path.startsWith('file:') ? fileURLToPath(path) : resolve(this.#root, path);
   }
 
   #record(inputs: readonly Input[]): Promise<Recorded[]> {
@@ -74,7 +81,7 @@ export class CacheEntry {
         dependency,
         state:
           'path' in dependency
-            ? await fileHash(resolve(this.#root, dependency.path))
+            ? await fileHash(this.#file(dependency.path))
             : await packageVersion(this.#root, dependency.package),
       })),
     );

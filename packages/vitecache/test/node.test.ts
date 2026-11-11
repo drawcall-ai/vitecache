@@ -1,9 +1,10 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, expect, test, vi } from 'vitest';
 import type { CacheEntryOptions, SaveOptions } from '../src/entry.js';
-import { CacheEntry } from '../src/node.js';
+import { CacheEntry, publicURL } from '../src/node.js';
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -59,6 +60,22 @@ test('inputs passed to save are checked without changing the key', async () => {
   expect(await load(options)).toEqual(new Uint8Array([1]));
   await writeFile(join(root, 'texture.png'), 'b');
   expect(await load(options)).toBeUndefined();
+});
+
+test('a file: URL input invalidates like a path', async () => {
+  const root = await project();
+  await writeFile(join(root, 'model.glts'), 'a');
+  const options = { root, version: 'url@1' };
+  await compute(options, [1], { dependencies: [{ path: pathToFileURL(join(root, 'model.glts')).href }] });
+  expect(await load(options)).toEqual(new Uint8Array([1]));
+  await writeFile(join(root, 'model.glts'), 'b');
+  expect(await load(options)).toBeUndefined();
+});
+
+test('without the plugin, publicURL maps a root-absolute path below the working directory\'s public', () => {
+  expect(publicURL('/tree/a b#.glts')).toBe(pathToFileURL(join(process.cwd(), 'public/tree/a b#.glts')).href);
+  for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts'])
+    expect(publicURL(url)).toBe(url);
 });
 
 test('save requires a load first and inputs that exist', async () => {

@@ -206,8 +206,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
         throw new Error('vitecache requires a Vite publicDir that does not contain the root');
       // Normalized, as are the files hotUpdate is given.
       directory = normalizePath(join(config.publicDir, cacheName));
-      shared.root = config.root;
-      shared.directory = directory;
+      shared.project = { root: config.root, publicDir: config.publicDir };
       const outputs = [config.build.outDir, config.publicDir].map((path) =>
         relative(config.root, resolve(config.root, path)),
       );

@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { CacheEntry } from '../src/browser.js';
+import { CacheEntry, publicURL } from '../src/browser.js';
 import { key } from '../src/entry.js';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -36,4 +36,9 @@ test('save writes nothing and warns once per version', async () => {
   await new CacheEntry({ version: 'warned@1' }).save(new Uint8Array([1]));
   expect(warn).toHaveBeenCalledOnce();
   expect(fetch).not.toHaveBeenCalled();
+});
+
+test('publicURL leaves URLs unchanged outside Node', () => {
+  vi.stubGlobal('process', undefined);
+  expect(publicURL('/tree/model.glts')).toBe('/tree/model.glts');
 });

@@ -10,7 +10,7 @@ test('in the built package, Node imports the Node entry, and browser bundles con
     '-e',
     "import * as api from 'vitecache'; console.log(import.meta.resolve('vitecache'), Object.keys(api).join());",
   ]);
-  expect(stdout.trim()).toMatch(/\/dist\/node\.js CacheEntry$/);
+  expect(stdout.trim()).toMatch(/\/dist\/node\.js CacheEntry,publicURL$/);
   const output = await build({
     configFile: false,
     logLevel: 'silent',
@@ -18,12 +18,14 @@ test('in the built package, Node imports the Node entry, and browser bundles con
       {
         name: 'consumer',
         resolveId: (id) => (id === resolve('consumer') ? '\0consumer' : undefined),
-        load: (id) => (id === '\0consumer' ? "export { CacheEntry } from 'vitecache';" : undefined),
+        load: (id) => (id === '\0consumer' ? "export { CacheEntry, publicURL } from 'vitecache';" : undefined),
       },
     ],
     build: { write: false, minify: false, lib: { entry: 'consumer', formats: ['es'] } },
   });
   const code = JSON.stringify(output);
   expect(code).toContain('CacheEntry');
-  expect(code).not.toMatch(/node:|process\.cwd/);
+  expect(code).toContain('publicURL');
+  // publicURL reads the working directory only once it has detected Node.
+  expect(code).not.toMatch(/node:|fileHash/);
 });
