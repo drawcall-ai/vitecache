@@ -21,10 +21,10 @@ function stack(error: unknown): string {
   return error instanceof Error ? (error.stack ?? error.message) : String(error);
 }
 
-/** Source files discovery scans, as Tailwind scans for class names, outside dependencies and outputs. */
-const sources = '**/*.{js,jsx,ts,tsx,mjs,mts}';
-/** Files discovery scans in publicDir: `.glts` asset scripts and the modules beside them. */
-const scripts = '**/*.{glts,js,jsx,ts,tsx,mjs,mts}';
+/** The JavaScript and TypeScript modules discovery scans, as Tailwind scans for class names. */
+const modules = 'js,jsx,ts,tsx,mjs,mts';
+/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
+const cacheName = '_vitecache';
 
 export interface VitecacheOptions {
   /** Development: milliseconds an entry stays after the last load that used it, so that an undone edit reuses it. */
@@ -32,15 +32,16 @@ export interface VitecacheOptions {
 }
 
 /**
- * Finds cached loader loads in the project's source files and public scripts and warms them in Node, so that browsers
- * read what Node saved, then deletes the entries no load uses. In development it scans and warms at startup and again
- * after every file change, holds cache requests until warming finishes, and deletes entries unused for `pruneAfter`. A
- * build scans and warms once, checks that a second pass saves nothing, and deletes every entry it did not use.
+ * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
+ * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
+ * load uses. In development it scans and warms at startup and again after every file change, holds cache requests
+ * until warming finishes, and deletes entries unused for `pruneAfter`. A build scans and warms once, checks that a
+ * second pass saves nothing, and deletes every entry it did not use.
  */
 export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugin {
   // The server a build runs loaders with loads the config, and so this plugin, again.
   if (shared.running) return { name: 'vitecache' };
-  /** The loads each source file holds. */
+  /** The loads each scanned file holds. */
   const files = new Map<string, Load[]>();
   let config: ResolvedConfig;
   let directory: string;
@@ -56,12 +57,8 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
   let closing = false;
   let timer: NodeJS.Timeout | undefined;
 
-  /** Project-relative patterns of what is not scanned as sources: dependencies, the build output, and publicDir. */
-  let excluded: string[];
-  let isSource: (file: string) => boolean;
-  /** publicDir-relative patterns of what is not scanned as scripts: dependencies and the cache directory. */
-  const hidden = ['**/node_modules/**', '_vitecache/**'];
-  const isScript = picomatch(scripts, { ignore: hidden });
+  /** The directories discovery scans, with patterns relative to each: the root, and publicDir. */
+  let trees: { root: string; pattern: string; excluded: string[]; matches: (path: string) => boolean }[];
   /** The path of a file in publicDir relative to it, undefined for any other file. */
   function publicPath(file: string): string | undefined {
     return file.startsWith(`${config.publicDir}/`) ? file.slice(config.publicDir.length + 1) : undefined;
@@ -186,11 +183,8 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
   }
 
   async function scanAll(): Promise<void> {
-    for (const file of [
-      ...(await glob(sources, { cwd: config.root, absolute: true, ignore: excluded })),
-      ...(await glob(scripts, { cwd: config.publicDir, absolute: true, ignore: hidden })),
-    ])
-      await scan(file);
+    for (const { root, pattern, excluded } of trees)
+      for (const file of await glob(pattern, { cwd: root, absolute: true, ignore: excluded })) await scan(file);
   }
 
   return {
@@ -198,16 +192,31 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     async configResolved(resolved) {
       config = resolved;
       if (!config.publicDir) throw new Error('vitecache requires Vite publicDir');
+      // Its files are scanned as public scripts, so it cannot also hold the sources.
+      if (`${config.root}/`.startsWith(`${config.publicDir}/`))
+        throw new Error('vitecache requires a Vite publicDir that does not contain the root');
       // Normalized, as are the files hotUpdate is given.
-      directory = normalizePath(join(config.publicDir, '_vitecache'));
+      directory = normalizePath(join(config.publicDir, cacheName));
       shared.root = config.root;
       shared.directory = directory;
       const outputs = [config.build.outDir, config.publicDir].map((path) =>
         relative(config.root, resolve(config.root, path)),
       );
-      // An output at the root itself excludes nothing, since the root holds the sources.
-      excluded = ['**/node_modules/**', ...outputs.filter(Boolean).map((path) => `${normalizePath(path)}/**`)];
-      isSource = picomatch(sources, { ignore: excluded });
+      const tree = (root: string, pattern: string, excluded: string[]) => ({
+        root,
+        pattern,
+        excluded,
+        matches: picomatch(pattern, { ignore: excluded }),
+      });
+      trees = [
+        // Not dependencies or outputs. An output at the root itself excludes nothing, since the root holds the sources.
+        tree(config.root, `**/*.{${modules}}`, [
+          '**/node_modules/**',
+          ...outputs.filter(Boolean).map((path) => `${normalizePath(path)}/**`),
+        ]),
+        // .glts scripts and every JavaScript and TypeScript module in publicDir.
+        tree(config.publicDir, `**/*.{glts,${modules}}`, ['**/node_modules/**', `${cacheName}/**`]),
+      ];
       await ignore(config.root, directory);
     },
     async buildStart() {
@@ -231,7 +240,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     configureServer(devServer) {
       server = devServer;
-      const prefix = `${config.base}_vitecache/`;
+      const prefix = `${config.base}${cacheName}/`;
       // Serves entries itself, after warming: Vite's public file serving learns of new files only through its watcher.
       devServer.middlewares.use((request, response, next) => {
         if (!request.url?.startsWith(prefix)) return next();
@@ -254,8 +263,9 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     async hotUpdate({ file }) {
       if (this.environment.name !== 'client' || file.startsWith(directory)) return;
-      const path = publicPath(file);
-      if (path === undefined ? isSource(normalizePath(relative(config.root, file))) : isScript(path)) await scan(file);
+      const scanned = ({ root, matches }: (typeof trees)[number]) =>
+        file.startsWith(`${root}/`) && matches(file.slice(root.length + 1));
+      if (trees.some(scanned)) await scan(file);
       // Any file can be an input, and an unchanged entry warms with one load. Saves are file changes too.
       void warm();
     },
