@@ -23,6 +23,8 @@ function stack(error: unknown): string {
 
 /** Source files discovery scans, as Tailwind scans for class names, outside dependencies and outputs. */
 const sources = '**/*.{js,jsx,ts,tsx,mjs,mts}';
+/** Files discovery scans in publicDir: `.glts` asset scripts and the modules beside them. */
+const scripts = '**/*.{glts,js,jsx,ts,tsx,mjs,mts}';
 
 export interface VitecacheOptions {
   /** Development: milliseconds an entry stays after the last load that used it, so that an undone edit reuses it. */
@@ -30,8 +32,8 @@ export interface VitecacheOptions {
 }
 
 /**
- * Finds cached loader loads in the project's source files and warms them in Node, so that browsers read what Node
- * saved, then deletes the entries no load uses. In development it scans and warms at startup and again after every
+ * Finds cached loader loads in the project's source files and public scripts and warms them in Node, so that browsers
+ * read what Node saved, then deletes the entries no load uses. In development it scans and warms at startup and again after every
  * file change, holds cache requests until warming finishes, and deletes entries unused for `pruneAfter`. A build scans
  * and warms once, checks that a second pass saves nothing, and deletes every entry it did not use.
  */
@@ -54,9 +56,16 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
   let closing = false;
   let timer: NodeJS.Timeout | undefined;
 
-  /** Project-relative patterns of what is not scanned: dependencies, the build output, and public files. */
+  /** Project-relative patterns of what is not scanned as sources: dependencies, the build output, and publicDir. */
   let excluded: string[];
   let isSource: (file: string) => boolean;
+  /** publicDir-relative patterns of what is not scanned as scripts: dependencies and the cache directory. */
+  const hidden = ['**/node_modules/**', '_vitecache/**'];
+  const isScript = picomatch(scripts, { ignore: hidden });
+  /** The path of a file in publicDir relative to it, undefined for any other file. */
+  function publicPath(file: string): string | undefined {
+    return file.startsWith(`${config.publicDir}/`) ? file.slice(config.publicDir.length + 1) : undefined;
+  }
 
   /** Records a file's loads. Development logs failures, since a file being edited can fail to parse. */
   async function scan(file: string): Promise<void> {
@@ -93,6 +102,14 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     const instance: unknown = Reflect.construct(exported, []);
     const loadable = typeof instance === 'object' && instance !== null && 'loadAsync' in instance;
     if (!loadable || typeof instance.loadAsync !== 'function') throw new Error(`${name} has no loadAsync method`);
+    const path = publicPath(importer);
+    if (path !== undefined) {
+      // A browser resolves a public file's relative URLs against its served URL, and a loader against its path.
+      if (!('setPath' in instance) || typeof instance.setPath !== 'function')
+        throw new Error(`${name} has no setPath method, which a load in a public file needs`);
+      const url = `${config.base}${path}`;
+      instance.setPath(url.slice(0, url.lastIndexOf('/') + 1));
+    }
     await instance.loadAsync(...args);
   }
 
@@ -169,7 +186,11 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
   }
 
   async function scanAll(): Promise<void> {
-    for (const file of await glob(sources, { cwd: config.root, absolute: true, ignore: excluded })) await scan(file);
+    for (const file of [
+      ...(await glob(sources, { cwd: config.root, absolute: true, ignore: excluded })),
+      ...(await glob(scripts, { cwd: config.publicDir, absolute: true, ignore: hidden })),
+    ])
+      await scan(file);
   }
 
   return {
@@ -233,7 +254,8 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     async hotUpdate({ file }) {
       if (this.environment.name !== 'client' || file.startsWith(directory)) return;
-      if (isSource(normalizePath(relative(config.root, file)))) await scan(file);
+      const path = publicPath(file);
+      if (path === undefined ? isSource(normalizePath(relative(config.root, file))) : isScript(path)) await scan(file);
       // Any file can be an input, and an unchanged entry warms with one load. Saves are file changes too.
       void warm();
     },

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, expect, test, vi } from 'vitest';
-import { build, createServer, type ViteDevServer } from 'vite';
+import { build, createLogger, createServer, type ViteDevServer } from 'vite';
 import { key } from '../src/entry.js';
 
 const servers: ViteDevServer[] = [];
@@ -14,7 +14,7 @@ afterEach(async () => {
 
 /**
  * A project whose page runs `main`, with a cached loader that saves its arguments and the contents of input.txt, and
- * logs each run outside the watched files.
+ * logs each run outside the watched files, and one that saves the URL it loads, resolved against its path.
  */
 async function project(main: string, version = "'echo@1'", options = ''): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
@@ -45,9 +45,31 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
       }
     }`,
   );
+  await writeFile(
+    join(root, 'src/located.js'),
+    `
+    import { CacheEntry } from ${JSON.stringify(resolve('src/node.ts'))};
+    export class CachedLocatedLoader {
+      setPath(path) { this.path = path; }
+      async loadAsync(url) {
+        const resolved = new URL(url, new URL(this.path, 'http://host')).pathname;
+        const entry = new CacheEntry({ version: 'located@1', dependencies: { url: { value: resolved } } });
+        if (await entry.load()) return;
+        await entry.save(new TextEncoder().encode(resolved));
+      }
+    }`,
+  );
   await writeFile(join(root, 'src/main.js'), `import { CachedEchoLoader as Echo } from './loader.js';\n${main}`);
   return root;
 }
+
+/** The loads public/tree/index.glts runs: one in TypeScript on a loader constructed with an argument. */
+const script = (loader: string) =>
+  `import { ${loader} as Loader } from '../../src/${loader === 'CachedEchoLoader' ? 'loader' : 'located'}.js';
+const manager: object = {};
+await new Loader(manager).loadAsync('./model.glts');`;
+
+const located = (url: string) => key({ version: 'located@1', dependencies: { url: { value: url } } });
 
 const runs = async (root: string) =>
   (await readFile(join(root, 'node_modules/runs.txt'), 'utf8')).split('\n').length - 1;
@@ -64,8 +86,6 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
     const echo = new Echo();
     await later();`);
   await mkdir(join(root, 'public/_vitecache'), { recursive: true });
-  // Public files are served as they are, so their loads are not the app's.
-  await writeFile(join(root, 'public/served.js'), "import { CachedEchoLoader as E } from '../src/loader.js'; [E];");
   await writeFile(join(root, 'public/_vitecache', `${'0'.repeat(64)}.bin`), 'stale');
   await writeFile(join(root, 'public/_vitecache', `${'0'.repeat(64)}.json`), '{}');
   await build({ root });
@@ -78,6 +98,39 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
   );
   expect(contents.sort()).toEqual(['"x"a', '2a', '{"n":-1,"list":[true,null,"x"]}a']);
   expect(await readdir(join(root, 'public/_vitecache'))).toEqual(deployed);
+});
+
+test.each([
+  ['/', '/tree/model.glts'],
+  ['/app/', '/app/tree/model.glts'],
+])('a build warms public scripts with base %s, setting the path of their loaders', async (base, url) => {
+  const root = await project('');
+  await mkdir(join(root, 'public/tree'), { recursive: true });
+  await writeFile(join(root, 'public/tree/index.glts'), script('CachedLocatedLoader'));
+  await writeFile(
+    join(root, 'public/tree/helper.js'),
+    "import { CachedLocatedLoader as L } from '../../src/located.js'; new L().loadAsync('../helper.bin');",
+  );
+  // The cache directory is not scanned: this misuse would fail the build.
+  await mkdir(join(root, 'public/_vitecache'));
+  await writeFile(join(root, 'public/_vitecache/misuse.js'), "import { CachedLocatedLoader as L } from 'x'; [L];");
+  await build({ root, base });
+  const contents = await Promise.all(
+    [located(url), located(url.replace('tree/model.glts', 'helper.bin'))].map((name) =>
+      readFile(join(root, 'dist/_vitecache', `${name}.bin`), 'utf8'),
+    ),
+  );
+  expect(contents).toEqual([url, url.replace('tree/model.glts', 'helper.bin')]);
+});
+
+test('a build fails on a load in a public script whose loader has no setPath', async () => {
+  const root = await project('');
+  await mkdir(join(root, 'public/tree'), { recursive: true });
+  await writeFile(join(root, 'public/tree/index.glts'), script('CachedEchoLoader'));
+  const errors: string[] = [];
+  const customLogger = { ...createLogger('silent'), error: (message: string) => void errors.push(message) };
+  await expect(build({ root, customLogger })).rejects.toThrow(/warming failed/);
+  expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
 });
 
 test('a build fails when a second warming saves again', async () => {
@@ -126,4 +179,9 @@ test('the dev server warms every load at startup, holds requests for it, warms a
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
   expect(await readdir(cache)).toContain(`${name(1)}.bin`);
   await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(`${name(1)}.bin`), { timeout: 2000 });
+  // A public script added later is scanned too.
+  await mkdir(join(root, 'public/tree'));
+  await writeFile(join(root, 'public/tree/index.glts'), script('CachedLocatedLoader'));
+  const entry = `${server.resolvedUrls?.local[0]}_vitecache/${located('/tree/model.glts')}.bin`;
+  await vi.waitFor(async () => expect(await (await fetch(entry)).text()).toBe('/tree/model.glts'));
 });
