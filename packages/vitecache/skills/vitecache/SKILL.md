@@ -37,9 +37,37 @@ export class CachedMeshLoader {
 
 Declare every input that affects the result, under a stable name. A `{ value }` is JSON that selects which result the entry holds: changing it, a name, a path or a package name changes the key, while reordering object properties does not. File contents and package versions invalidate the entry without changing its key.
 
-A `{ path }` is relative to the project root, never to the importing module. A `{ package }` tracks only that package's installed version, so declare transitive packages separately when their versions matter. Bump `version` for changes the dependencies do not capture, such as a linked workspace package changed without a new version.
+A `{ path }` is relative to the project root, never to the importing module; on `save()` it may also be a `file:` URL. A `{ package }` tracks only that package's installed version, so declare transitive packages separately when their versions matter. Bump `version` for changes the dependencies do not capture, such as a linked workspace package changed without a new version.
 
 When inputs are only discovered while computing, such as the textures a model references, pass them to `save()` as its `dependencies`, like a compiler's depfile. They are checked on every load without being part of the key.
+
+A load in a public script, such as a `.glts` asset installed into `public/`, may pass URLs relative to the script. Before it, the plugin calls the loader's `setPath` with the script's URL directory without Vite's base, such as `/tree/` for `public/tree/index.glts`, and fails the load if the loader has none. In the browser nothing calls `setPath`, and the script's `LoadingManager`, such as the one glts provides, resolves URLs to their served URLs instead. Key on the path below the app's base, which both give, and read at `publicURL()` of the resolved URL, which in Node is the file's `file:` URL:
+
+```ts
+import { Loader } from "three"
+import { CacheEntry, publicURL } from "vitecache"
+
+const basePath = "/_vitecache/" // the cache's URL, with the app's base
+
+export class CachedModelLoader extends Loader {
+  async loadAsync(url: string): Promise<Model> {
+    const served = this.manager.resolveURL(this.path + url)
+    // In Node, the path setPath gave has no base; a served URL has the app's.
+    const base = served.startsWith("/") ? "/" : new URL("..", new URL(basePath, served)).pathname
+    const path = `/${new URL(served, "http://node").pathname.slice(base.length)}`
+    const entry = new CacheEntry({ version: "model@1", basePath, dependencies: { path: { value: path } } })
+    let bytes = await entry.load()
+    if (bytes === undefined) {
+      const file = publicURL(served)
+      bytes = encodeModel(await buildModel(await read(file)))
+      await entry.save(bytes, { dependencies: [{ path: file }] })
+    }
+    return decodeModel(bytes)
+  }
+}
+```
+
+Node's `fetch` refuses `file:` URLs, so `read` must handle them.
 
 ## Using loaders
 
@@ -52,9 +80,9 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
+A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, which the plugin calls itself for loads in public scripts, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
 
-The plugin finds loads by scanning the project's JavaScript and TypeScript files, as Tailwind scans for class names, and matches the loader's imported name through aliases and namespace imports. It skips `node_modules`, the build output and `publicDir`, so a library's loaders are warmed only where the app uses them. It does not read `.vue` or `.svelte` files, and it warms a load in a file the app never imports, such as a test. Since variables are matched by name in the module, give a loader variable a name no other variable in that module uses.
+The plugin finds loads by scanning the project's JavaScript and TypeScript files, as Tailwind scans for class names, and matches the loader's imported name through aliases and namespace imports. It also scans the `.glts` scripts and every JavaScript and TypeScript module in `publicDir`, so assets installed there are warmed too. It skips `node_modules` and the build output, so a library's loaders are warmed only where the app uses them. It does not read `.vue` or `.svelte` files, and it warms a load in a file the app never imports, such as a test. Since variables are matched by name in the module, give a loader variable a name no other variable in that module uses.
 
 The plugin repeats each load in Node by importing the loader's module through Vite's SSR loading. That module and its top-level imports must load without browser globals, and whatever the loader does after loading, such as decoding, runs in Node too. A build loads the Vite config file again to run the loaders, so configure plugins they rely on there rather than inline in a programmatic build.
 
@@ -68,4 +96,4 @@ Browsers only read entries. A browser that misses, for a load the plugin could n
 
 Entries keep their file names when their contents change, so browsers revalidate them before each use. Serve the cache directory with `ETag` or `Last-Modified`, as most static hosts do, and do not mark it immutable. When deploying below a URL prefix, pass that prefix with the cache path as `basePath`, such as `/app/_vitecache/`; the entry does not infer Vite's base.
 
-The plugin adds the cache directory, `public/_vitecache/`, to `.gitignore`. A Node script outside Vite can use the same loaders. Its entries use `public/_vitecache/` below the working directory, or below `root` when passed.
+The plugin adds the cache directory, `public/_vitecache/`, to `.gitignore`. A Node script outside Vite can use the same loaders. Its entries use `public/_vitecache/` below the working directory, or below `root` when passed, while `publicURL()` always reads `public/` below the working directory.

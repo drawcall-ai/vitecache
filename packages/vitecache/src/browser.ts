@@ -3,6 +3,11 @@ export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } fro
 
 const warned = new Set<string>();
 
+/** The URL to read a public file at: in browsers, its URL itself, since they load public files over HTTP. */
+export function publicURL(url: string): string {
+  return url;
+}
+
 /** A cached result, read from the cache directory the app serves. Only Node writes entries. */
 export class CacheEntry {
   readonly #version: string;

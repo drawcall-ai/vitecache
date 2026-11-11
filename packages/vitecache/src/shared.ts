@@ -3,10 +3,18 @@ declare global {
   var vitecache: Shared | undefined;
 }
 
+/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
+export const cacheName = '_vitecache';
+
+/** A project root and its publicDir, which holds the cache directory. */
+export interface Project {
+  root: string;
+  publicDir: string;
+}
+
 interface Shared {
   /** The plugin's project. */
-  root?: string;
-  directory?: string;
+  project?: Project;
   /** When each key was last loaded in this process, which the plugin prunes by. */
   used: Map<string, number>;
   /** How many entries this process saved, which a build's second pass checks. */
