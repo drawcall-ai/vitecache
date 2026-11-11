@@ -26,6 +26,19 @@ const modules = 'js,jsx,ts,tsx,mjs,mts';
 /** The cache directory's name in publicDir, which is also its URL below Vite's base. */
 const cacheName = '_vitecache';
 
+/** A directory discovery scans, with patterns relative to it. */
+interface Tree {
+  root: string;
+  pattern: string;
+  excluded: string[];
+  matches: (path: string) => boolean;
+}
+
+/** The path of `file` relative to `directory`, undefined for a file outside it. Both are normalized. */
+function below(directory: string, file: string): string | undefined {
+  return file.startsWith(`${directory}/`) ? file.slice(directory.length + 1) : undefined;
+}
+
 export interface VitecacheOptions {
   /** Development: milliseconds an entry stays after the last load that used it, so that an undone edit reuses it. */
   pruneAfter?: number;
@@ -58,11 +71,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
   let timer: NodeJS.Timeout | undefined;
 
   /** The directories discovery scans, with patterns relative to each: the root, and publicDir. */
-  let trees: { root: string; pattern: string; excluded: string[]; matches: (path: string) => boolean }[];
-  /** The path of a file in publicDir relative to it, undefined for any other file. */
-  function publicPath(file: string): string | undefined {
-    return file.startsWith(`${config.publicDir}/`) ? file.slice(config.publicDir.length + 1) : undefined;
-  }
+  let trees: Tree[];
 
   /** Records a file's loads. Development logs failures, since a file being edited can fail to parse. */
   async function scan(file: string): Promise<void> {
@@ -99,7 +108,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     const instance: unknown = Reflect.construct(exported, []);
     const loadable = typeof instance === 'object' && instance !== null && 'loadAsync' in instance;
     if (!loadable || typeof instance.loadAsync !== 'function') throw new Error(`${name} has no loadAsync method`);
-    const path = publicPath(importer);
+    const path = below(config.publicDir, importer);
     if (path !== undefined) {
       // A browser resolves a public file's relative URLs against its served URL, and a loader against its path. The
       // path leaves out Vite's base, so that keys do not depend on where the app is deployed.
@@ -202,7 +211,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       const outputs = [config.build.outDir, config.publicDir].map((path) =>
         relative(config.root, resolve(config.root, path)),
       );
-      const tree = (root: string, pattern: string, excluded: string[]) => ({
+      const tree = (root: string, pattern: string, excluded: string[]): Tree => ({
         root,
         pattern,
         excluded,
@@ -214,7 +223,6 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
           '**/node_modules/**',
           ...outputs.filter(Boolean).map((path) => `${normalizePath(path)}/**`),
         ]),
-        // .glts scripts and every JavaScript and TypeScript module in publicDir.
         tree(config.publicDir, `**/*.{glts,${modules}}`, ['**/node_modules/**', `${cacheName}/**`]),
       ];
       await ignore(config.root, directory);
@@ -263,9 +271,11 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     async hotUpdate({ file }) {
       if (this.environment.name !== 'client' || file.startsWith(directory)) return;
-      const scanned = ({ root, matches }: (typeof trees)[number]) =>
-        file.startsWith(`${root}/`) && matches(file.slice(root.length + 1));
-      if (trees.some(scanned)) await scan(file);
+      const scanned = trees.some(({ root, matches }) => {
+        const path = below(root, file);
+        return path !== undefined && matches(path);
+      });
+      if (scanned) await scan(file);
       // Any file can be an input, and an unchanged entry warms with one load. Saves are file changes too.
       void warm();
     },
