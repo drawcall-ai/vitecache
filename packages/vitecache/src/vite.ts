@@ -33,9 +33,9 @@ export interface VitecacheOptions {
 
 /**
  * Finds cached loader loads in the project's source files and public scripts and warms them in Node, so that browsers
- * read what Node saved, then deletes the entries no load uses. In development it scans and warms at startup and again after every
- * file change, holds cache requests until warming finishes, and deletes entries unused for `pruneAfter`. A build scans
- * and warms once, checks that a second pass saves nothing, and deletes every entry it did not use.
+ * read what Node saved, then deletes the entries no load uses. In development it scans and warms at startup and again
+ * after every file change, holds cache requests until warming finishes, and deletes entries unused for `pruneAfter`. A
+ * build scans and warms once, checks that a second pass saves nothing, and deletes every entry it did not use.
  */
 export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugin {
   // The server a build runs loaders with loads the config, and so this plugin, again.
@@ -104,11 +104,11 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     if (!loadable || typeof instance.loadAsync !== 'function') throw new Error(`${name} has no loadAsync method`);
     const path = publicPath(importer);
     if (path !== undefined) {
-      // A browser resolves a public file's relative URLs against its served URL, and a loader against its path.
+      // A browser resolves a public file's relative URLs against its served URL, and a loader against its path. The
+      // path leaves out Vite's base, so that keys do not depend on where the app is deployed.
       if (!('setPath' in instance) || typeof instance.setPath !== 'function')
         throw new Error(`${name} has no setPath method, which a load in a public file needs`);
-      const url = `${config.base}${path}`;
-      instance.setPath(url.slice(0, url.lastIndexOf('/') + 1));
+      instance.setPath(`/${path.slice(0, path.lastIndexOf('/') + 1)}`);
     }
     await instance.loadAsync(...args);
   }

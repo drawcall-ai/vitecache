@@ -100,10 +100,7 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
   expect(await readdir(join(root, 'public/_vitecache'))).toEqual(deployed);
 });
 
-test.each([
-  ['/', '/tree/model.glts'],
-  ['/app/', '/app/tree/model.glts'],
-])('a build warms public scripts with base %s, setting the path of their loaders', async (base, url) => {
+test.each(['/', '/app/', './'])('a build warms public scripts with base %s, setting their loaders path', async (base) => {
   const root = await project('');
   await mkdir(join(root, 'public/tree'), { recursive: true });
   await writeFile(join(root, 'public/tree/index.glts'), script('CachedLocatedLoader'));
@@ -115,12 +112,11 @@ test.each([
   await mkdir(join(root, 'public/_vitecache'));
   await writeFile(join(root, 'public/_vitecache/misuse.js'), "import { CachedLocatedLoader as L } from 'x'; [L];");
   await build({ root, base });
+  const urls = ['/tree/model.glts', '/helper.bin'];
   const contents = await Promise.all(
-    [located(url), located(url.replace('tree/model.glts', 'helper.bin'))].map((name) =>
-      readFile(join(root, 'dist/_vitecache', `${name}.bin`), 'utf8'),
-    ),
+    urls.map((url) => readFile(join(root, 'dist/_vitecache', `${located(url)}.bin`), 'utf8')),
   );
-  expect(contents).toEqual([url, url.replace('tree/model.glts', 'helper.bin')]);
+  expect(contents).toEqual(urls);
 });
 
 test('a build fails on a load in a public script whose loader has no setPath', async () => {
