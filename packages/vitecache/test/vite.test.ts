@@ -8,6 +8,7 @@ import { key } from '../src/entry.js';
 const servers: ViteDevServer[] = [];
 const roots: string[] = [];
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await Promise.all(servers.splice(0).map((server) => server.close()));
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -187,6 +188,25 @@ test('the dev server warms every load at startup, holds requests for it, and war
   );
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
   expect(await readdir(cache)).not.toContain(`${name(1)}.bin`);
+});
+
+test('a dev server whose global another plugin took over prunes nothing', async () => {
+  const root = await project('new Echo().loadAsync(1);');
+  await writeFile(join(root, '.gitignore'), 'public/_vitecache/*\n');
+  const server = await createServer({ root, server: { port: 0 } });
+  servers.push(server);
+  await server.listen();
+  const name = key({ version: 'echo@1', dependencies: { value: { value: 1 }, input: { path: 'input.txt' } } });
+  const url = `${server.resolvedUrls?.local[0]}_vitecache/${name}.bin`;
+  expect(await (await fetch(url)).text()).toBe('1a');
+  const current = globalThis.vitecache;
+  if (!current) throw new Error('the plugin set no global');
+  vi.stubGlobal('vitecache', { ...current, loaded: new Set() });
+  const stale = join(root, 'public/_vitecache', `${'0'.repeat(64)}.bin`);
+  await writeFile(stale, 'stale');
+  await writeFile(join(root, 'input.txt'), 'b');
+  await vi.waitFor(async () => expect(await (await fetch(url)).text()).toBe('1b'));
+  expect(await readFile(stale, 'utf8')).toBe('stale');
 });
 
 test('the dev server scans a public script added while it runs', async () => {
