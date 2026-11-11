@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "precompute": "node --import tsx src/compute.ts",
-    "build": "pnpm precompute && vite build",
+    "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },
@@ -15,7 +14,6 @@
     "elkjs": "0.12.0"
   },
   "devDependencies": {
-    "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^8.0.0"
   }

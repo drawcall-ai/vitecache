@@ -1,116 +1,40 @@
-import { dependencies, equalHashes, hashableDependencies, isChecked, MissingDependencyError, savedDependencies } from './dependencies.js';
-import { key } from './key.js';
-import type { Backend, CacheEntryOptions, Dependencies, Hashable, SaveOptions, Snapshot } from './types.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+import { configure } from 'safe-stable-stringify';
 
-export class Entry {
-  readonly #version: string;
-  #resolution: Promise<{ key: string; checked: Dependencies<Hashable> }> | undefined;
-  readonly #dependencies: Dependencies;
-  readonly #hasChecked: boolean;
-  readonly #backend: Backend;
-  #baseline: Snapshot | undefined;
-  #pending = false;
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-  constructor(options: CacheEntryOptions, backend: Backend) {
-    if (typeof options.version !== 'string' || !options.version) throw new TypeError('CacheEntry requires a nonempty version.');
-    this.#dependencies = dependencies(options.dependencies ?? {});
-    this.#hasChecked = Object.values(this.#dependencies).some(isChecked);
-    this.#version = options.version;
-    this.#backend = backend;
-  }
+/** A file, relative to the project root, or an installed package, whose current state an entry is checked against. */
+export type Input = { readonly path: string } | { readonly package: string };
 
-  #resolve(): Promise<{ key: string; checked: Dependencies<Hashable> }> {
-    this.#resolution ??= this.#backend.resolve(this.#dependencies).then((dependencies) => ({
-      key: key(this.#version, dependencies),
-      // Values are fully captured by the key, so only the rest is checked.
-      checked: Object.fromEntries(Object.entries(dependencies).flatMap(([name, dependency]) => isChecked(dependency) ? [[name, dependency] as const] : [])),
-    })).catch((error: unknown) => {
-      this.#resolution = undefined;
-      throw error;
-    });
-    return this.#resolution;
-  }
+/** A JSON value selects which result an entry holds; an input invalidates it when it changes. */
+export type Dependency = { readonly value: JsonValue } | Input;
 
-  async #snapshot(): Promise<Snapshot> {
-    try {
-      return await this.#backend.snapshot((await this.#resolve()).checked);
-    } catch (error) {
-      if (!(error instanceof MissingDependencyError)) throw error;
-      return { status: 'missing', message: error.message };
-    }
-  }
-
-  /** Checks validity like load(). Warns on browser misses without the Vite plugin. */
-  async has(): Promise<boolean> {
-    const found = await this.load() !== undefined;
-    if (!found && !await this.#backend.canSave()) {
-      console.warn(`vitecache: cache miss for ${this.#version}. Install the vitecache Vite plugin to generate cache files.`);
-    }
-    return found;
-  }
-
+export interface CacheEntryOptions {
+  /** Identifies the computation and its implementation, for example "simplify@2". */
+  version: string;
+  /** Named dependencies. Names and declarations make up the entry's key; file contents and package versions do not. */
+  dependencies?: Readonly<Record<string, Dependency>>;
   /**
-   * Returns undefined for missing dependencies or missing/stale results, saved dependencies included. A miss captures
-   * dependency hashes until the next save attempt finishes. A hit is a plain Uint8Array, not a Node Buffer, that owns
-   * its whole ArrayBuffer in Node and browsers alike: its slice() copies, and its buffer can be transferred.
+   * Node: the project root, whose public/_vitecache is the cache directory. Defaults to the Vite project, and its
+   * publicDir, while the vitecache plugin runs, else to process.cwd().
    */
-  async load(): Promise<Uint8Array | undefined> {
-    // Value dependencies are fully captured by the key, so there is nothing to validate or baseline.
-    if (!this.#hasChecked) return (await this.#backend.load((await this.#resolve()).key))?.bytes;
-    const snapshot = await this.#snapshot();
-    if (!this.#pending) {
-      this.#baseline = snapshot;
-    }
-    if (snapshot.status === 'missing') {
-      this.#pending = true;
-      return undefined;
-    }
-    const { key } = await this.#resolve();
-    const stored = await this.#backend.load(key);
-    if (!stored) {
-      this.#pending = true;
-      return undefined;
-    }
-    if (snapshot.status === 'current') {
-      // A backend that checked dependencies serves their hashes with every entry.
-      if (!stored.hashes) throw new Error('vitecache served an entry without its dependency hashes.');
-      if (!equalHashes(snapshot.hashes, stored.hashes)) {
-        this.#pending = true;
-        return undefined;
-      }
-    }
-    return stored.bytes;
-  }
+  root?: string;
+  /** Browsers: the URL the cache directory is served at, including any Vite base. Defaults to /_vitecache/. */
+  basePath?: string;
+}
 
-  /**
-   * Saves bytes on disk. With file or package dependencies, call load()/has() before computing: a dependency that changed
-   * since then rejects with ChangedDependenciesError, and one without a backing file, such as a server route, a virtual
-   * module or a package the app does not install, with MissingDependencyError. Without the Vite plugin, browser saves
-   * warn and skip the write.
-   */
-  async save(value: Uint8Array, options: SaveOptions = {}): Promise<void> {
-    const bytes = new Uint8Array(value);
-    const saved = savedDependencies(options.dependencies ?? {});
-    const expected = this.#baseline;
-    try {
-      if (!await this.#backend.canSave()) {
-        console.warn('vitecache: save skipped. Install the vitecache Vite plugin to write cache files from the browser.');
-        return;
-      }
-      if (this.#hasChecked && expected === undefined) {
-        throw new Error('Call CacheEntry.load() or has() before computing a result with file or package dependencies.');
-      }
-      if (expected?.status === 'missing') throw new MissingDependencyError(`Cannot save a cache entry with a missing dependency. ${expected.message}`);
-      const resolved = await this.#resolve();
-      const hashes = expected?.status === 'current' ? expected.hashes : {};
-      await this.#backend.save(resolved.key, bytes, {
-        checked: resolved.checked,
-        expected: hashes,
-        saved: hashableDependencies(await this.#backend.resolve(saved)),
-      });
-    } finally {
-      this.#pending = false;
-      this.#baseline = undefined;
-    }
-  }
+export interface SaveOptions {
+  /** Inputs the computation turned out to read. Checked on every load like declared ones, without changing the key. */
+  dependencies?: readonly Input[];
+}
+
+/** JSON with sorted object keys, so that declaration order does not change the key; anything else throws. */
+const stringify = configure({ strict: true });
+
+/** The entry's name in the cache directory. */
+export function key(options: CacheEntryOptions): string {
+  if (!options.version) throw new TypeError('CacheEntry requires a version.');
+  const declaration = stringify({ version: options.version, dependencies: options.dependencies ?? {} });
+  return bytesToHex(sha256(new TextEncoder().encode(declaration)));
 }
