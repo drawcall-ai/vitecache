@@ -35,7 +35,7 @@ export class CachedMeshLoader {
 }
 ```
 
-Declare every input that affects the result, under a stable name. A `{ value }` is JSON that selects which result the entry holds: changing it, a name, a path or a package name changes the key, while reordering object properties does not. File contents and package versions invalidate the entry without changing its key.
+Declare every input that affects the result, under a stable name. A `{ value }` is JSON that selects which result the entry holds: changing it, a name, a path or a package name changes the key, while reordering object properties does not. Nothing checks that a key is the same in every run, so one built from a timestamp, for example, makes browsers miss. File contents and package versions invalidate the entry without changing its key.
 
 A `{ path }` is relative to the project root, never to the importing module; on `save()` it may also be a `file:` URL. A `{ package }` tracks only that package's installed version, so declare transitive packages separately when their versions matter. Bump `version` for changes the dependencies do not capture, such as a linked workspace package changed without a new version.
 
@@ -86,9 +86,9 @@ The plugin finds loads by scanning the project's JavaScript and TypeScript files
 
 The plugin repeats each load in Node by importing the loader's module through Vite's SSR loading. That module and its top-level imports must load without browser globals, and whatever the loader does after loading, such as decoding, runs in Node too. A build loads the Vite config file again to run the loaders, so configure plugins they rely on there rather than inline in a programmatic build.
 
-In development the plugin warms every load at startup and again after every file change, and the page's cache requests wait for it, so the browser normally hits. It deletes entries no load uses: at startup, those left from earlier sessions, and later, an entry replaced by an edit once it has gone unused for `pruneAfter`, a minute by default, so that undoing the edit within that time reuses it. A build warms every load, then repeats them all and fails if that second pass saves anything, which means a key that changes between runs, such as one built from a timestamp. It then deletes every entry the build did not use, so the deployment holds exactly what the app requests.
+In development the plugin warms every load at startup and again after every file change, and the page's cache requests wait for it, so the browser normally hits. It deletes entries no load uses: at startup, those left from earlier sessions, and later, an entry replaced by an edit once it has gone unused for `pruneAfter`, a minute by default, so that undoing the edit within that time reuses it. A build warms every load once, then deletes every entry the build did not use, so the deployment holds exactly what the app requests.
 
-Development and builds log each load that computes, by loader and source location, and announce a load still running after half a second; loads that hit are silent.
+Development and builds announce a load still running after half a second, by loader and source location.
 
 ## Browsers and deployment
 

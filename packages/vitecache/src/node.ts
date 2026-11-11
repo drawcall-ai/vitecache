@@ -128,7 +128,6 @@ export class CacheEntry {
     const inputs = [...this.#loaded, ...(await this.#record(saved))];
     const missing = inputs.find((input) => input.state === undefined);
     if (missing) throw new Error(`vitecache input has no file or package: ${JSON.stringify(missing.dependency)}`);
-    shared.saves++;
     // Atomic writes, so that a reader sees the old file or the new one.
     await mkdir(this.#directory, { recursive: true });
     await writeFileAtomic(

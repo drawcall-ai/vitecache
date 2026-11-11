@@ -17,7 +17,7 @@ afterEach(async () => {
  * logs each run outside the watched files, and one that keys on the URL it loads, resolved against its path, and saves
  * that path, with the public file as an input.
  */
-async function project(main: string, version = "'echo@1'", options = ''): Promise<string> {
+async function project(main: string, options = ''): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
   roots.push(root);
   await mkdir(join(root, 'src'));
@@ -39,7 +39,7 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
       async loadAsync(value) {
         await appendFile(new URL('../node_modules/runs.txt', import.meta.url), 'run\\n');
         const dependencies = { value: { value }, input: { path: 'input.txt' } };
-        const entry = new CacheEntry({ version: ${version}, dependencies });
+        const entry = new CacheEntry({ version: 'echo@1', dependencies });
         if (await entry.load()) return;
         const input = await readFile(new URL('../input.txt', import.meta.url), 'utf8');
         await entry.save(new TextEncoder().encode(JSON.stringify(value) + input));
@@ -138,11 +138,6 @@ test('a build fails on a load in a public script whose loader has no setPath', a
   expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
 });
 
-test('a build fails when a second warming saves again', async () => {
-  const root = await project('new Echo().loadAsync(1);', 'String(Math.random())');
-  await expect(build({ root })).rejects.toThrow(/keys are not stable/);
-});
-
 test.each([
   ['a non-literal argument', 'new Echo().loadAsync(Date.now());', /literal JSON/],
   ['a loader passed around', 'const echo = new Echo(); [echo];', /loadAsync/],
@@ -155,7 +150,7 @@ test.each([
 });
 
 test('the dev server warms every load at startup, holds requests for it, warms after changes, and prunes', async () => {
-  const root = await project('new Echo().loadAsync(1);', "'echo@1'", '{ pruneAfter: 300 }');
+  const root = await project('new Echo().loadAsync(1);', '{ pruneAfter: 300 }');
   const cache = join(root, 'public/_vitecache');
   const stale = `${'0'.repeat(64)}.bin`;
   await mkdir(cache, { recursive: true });

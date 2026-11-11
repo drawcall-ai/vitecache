@@ -46,8 +46,8 @@ export interface VitecacheOptions {
  * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
  * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
  * load uses. In development it scans and warms at startup and again after every file change, holds cache requests
- * until warming finishes, and deletes entries unused for `pruneAfter`. A build scans and warms once, checks that a
- * second pass saves nothing, and deletes every entry it did not use.
+ * until warming finishes, and deletes entries unused for `pruneAfter`. A build scans and warms once, and deletes every
+ * entry it did not use.
  */
 export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugin {
   // The server a build runs loaders with loads the config, and so this plugin, again.
@@ -125,7 +125,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     config.logger[level](`${colors.dim(new Date().toLocaleTimeString())} ${tag} ${message}`);
   }
 
-  /** Runs every load once, one at a time. Hits are silent; a load that computes is logged, and announced when slow. */
+  /** Runs every load once, one at a time. A load still running after half a second is announced. */
   async function pass(): Promise<void> {
     queued = false;
     started = Date.now();
@@ -133,24 +133,15 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       if (closing) return;
       const file = normalizePath(relative(config.root, load.importer));
       const where = `${load.name} ${colors.dim(`${file}:${load.position}`)}`;
-      const start = Date.now();
-      const saves = shared.saves;
       const slow = setTimeout(() => log(`${colors.yellow('computing')} ${where}…`), 500);
       try {
         await run(load);
       } catch (error) {
         failed = true;
         log(`${colors.red('failed')} ${where}\n${stack(error)}`, 'error');
-        continue;
       } finally {
         clearTimeout(slow);
       }
-      const computed = shared.saves - saves;
-      if (!computed) continue;
-      const time = Date.now() - start;
-      const took = time < 1000 ? `${time} ms` : `${(time / 1000).toFixed(1)} s`;
-      const entries = computed > 1 ? `, ${computed} entries` : '';
-      log(`${colors.green('computed')} ${where} ${colors.dim(`in ${took}${entries}`)}`);
     }
   }
 
@@ -233,11 +224,6 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
         await scanAll();
         await warm();
         if (failed) throw new Error('vitecache: warming failed, see the errors above.');
-        const saves = shared.saves;
-        await warm();
-        if (failed) throw new Error('vitecache: warming failed, see the errors above.');
-        if (shared.saves !== saves)
-          throw new Error('vitecache: a second warming saved entries again, so their keys are not stable.');
       } finally {
         await server?.close();
         server = undefined;
