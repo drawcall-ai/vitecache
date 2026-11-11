@@ -2,12 +2,11 @@ import { createHash } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
 import { missing, read } from './disk.js';
 import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
-import { project, shared } from './shared.js';
-export { publicURL } from './shared.js';
+import { shared, type Project } from './shared.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
 /** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
@@ -50,6 +49,23 @@ async function packageVersion(root: string, name: string): Promise<string | unde
     return manifest.version;
   }
   return undefined;
+}
+
+/** The project at `root`; without one, the plugin's while it runs in this process, else the working directory. */
+function project(root?: string): Project {
+  if (root === undefined && shared.project) return shared.project;
+  root ??= process.cwd();
+  return { root, publicDir: `${root}/public` };
+}
+
+/**
+ * The URL to read a public file at: for a root-absolute path such as `/tree/model.glts`, the `file:` URL of that file
+ * below publicDir, without the path's query and hash. Any other URL is returned unchanged.
+ */
+export function publicURL(url: string): string {
+  if (!url.startsWith('/') || url.startsWith('//')) return url;
+  const path = url.replace(/[?#].*/s, '');
+  return new URL(`.${path}`, pathToFileURL(`${project().publicDir}/`)).href;
 }
 
 /** A cached result in the cache directory on disk, which Node computes and saves for every environment. */

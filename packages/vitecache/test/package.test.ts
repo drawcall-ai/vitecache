@@ -25,7 +25,5 @@ test('in the built package, Node imports the Node entry, and browser bundles con
   });
   const code = JSON.stringify(output);
   expect(code).toContain('CacheEntry');
-  expect(code).toContain('publicURL');
-  // publicURL reads the working directory only once it has detected Node.
-  expect(code).not.toMatch(/node:|fileHash/);
+  expect(code).not.toMatch(/node:|process\.cwd/);
 });

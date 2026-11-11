@@ -73,9 +73,16 @@ test('a file: URL input invalidates like a path', async () => {
 });
 
 test('without the plugin, publicURL maps a root-absolute path below the working directory\'s public', () => {
-  expect(publicURL('/tree/a b#.glts')).toBe(pathToFileURL(join(process.cwd(), 'public/tree/a b#.glts')).href);
+  const file = pathToFileURL(join(process.cwd(), 'public/tree/a b.glts')).href;
+  expect(publicURL('/tree/a%20b.glts')).toBe(file);
+  expect(publicURL('/tree/a%20b.glts?v=1#top')).toBe(file);
   for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts'])
     expect(publicURL(url)).toBe(url);
+});
+
+test('a file: URL among the declared dependencies is refused, since it belongs on save()', () => {
+  const dependencies = { model: { path: pathToFileURL('/model.glts').href } };
+  expect(() => new CacheEntry({ version: 'url@1', dependencies })).toThrow(/Pass it to save\(\)/);
 });
 
 test('save requires a load first and inputs that exist', async () => {

@@ -5,8 +5,8 @@ import { configure } from 'safe-stable-stringify';
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 /**
- * A file, relative to the project root or as a `file:` URL, or an installed package, whose current state an entry is
- * checked against.
+ * A file, relative to the project root or, passed to save(), as a `file:` URL, or an installed package, whose current
+ * state an entry is checked against.
  */
 export type Input = { readonly path: string } | { readonly package: string };
 
@@ -38,6 +38,12 @@ const stringify = configure({ strict: true });
 /** The entry's name in the cache directory. */
 export function key(options: CacheEntryOptions): string {
   if (!options.version) throw new TypeError('CacheEntry requires a version.');
+  for (const [name, dependency] of Object.entries(options.dependencies ?? {}))
+    if ('path' in dependency && dependency.path.startsWith('file:'))
+      throw new TypeError(
+        `CacheEntry dependency ${name} is a file: URL, which would key differently per machine and in browsers. ` +
+          'Pass it to save() instead.',
+      );
   const declaration = stringify({ version: options.version, dependencies: options.dependencies ?? {} });
   return bytesToHex(sha256(new TextEncoder().encode(declaration)));
 }
