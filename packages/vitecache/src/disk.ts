@@ -1,5 +1,18 @@
 import { readFile } from 'node:fs/promises';
 
+declare global {
+  /**
+   * The vitecache plugin's project in this Node process, which CacheEntry and publicURL use when given no root, and the
+   * keys loaded since its latest pass started, which it prunes by. Set when its config resolves and kept for the
+   * process; global, because Vite's module runner gives loaders their own copy of vitecache. One plugin per process: a
+   * newer one, as a restarted dev server makes, takes it over, and an older one's passes then prune nothing.
+   */
+  var vitecache: { root: string; publicDir: string; loaded: Set<string> } | undefined;
+}
+
+/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
+export const cacheName = '_vitecache';
+
 export function missing(error: unknown): boolean {
   return error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
 }

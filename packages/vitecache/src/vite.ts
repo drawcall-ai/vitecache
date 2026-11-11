@@ -4,9 +4,8 @@ import colors from 'picocolors';
 import picomatch from 'picomatch';
 import { glob } from 'tinyglobby';
 import { createServer, normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
-import { missing, read } from './disk.js';
+import { cacheName, missing, read } from './disk.js';
 import { discover, type Load } from './discover.js';
-import { cacheName, shared } from './shared.js';
 
 /** Adds the cache directory to the project's .gitignore, since its entries are generated. */
 async function ignore(root: string, directory: string): Promise<void> {
@@ -37,36 +36,30 @@ function below(directory: string, file: string): string | undefined {
   return file.startsWith(`${directory}/`) ? file.slice(directory.length + 1) : undefined;
 }
 
-export interface VitecacheOptions {
-  /** Development: milliseconds an entry stays after the last load that used it, so that an undone edit reuses it. */
-  pruneAfter?: number;
-}
+/** Marks the server the plugin warms with in a build, which loads the config, and so the plugin, again. */
+const warmServerMarker = 'vitecache:warm';
 
 /**
  * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
  * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
- * load uses. In development it scans and warms at startup and again after every file change, holds cache requests
- * until warming finishes, and deletes entries unused for `pruneAfter`. A build scans and warms once, checks that a
- * second pass saves nothing, and deletes every entry it did not use.
+ * load uses. In development it scans and warms at startup and again after every file change, and holds cache requests
+ * until warming finishes. A build scans and warms once.
  */
-export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugin {
-  // The server a build runs loaders with loads the config, and so this plugin, again.
-  if (shared.running) return { name: 'vitecache' };
+export function vitecache(): Plugin {
   /** The loads each scanned file holds. */
   const files = new Map<string, Load[]>();
   let config: ResolvedConfig;
+  const loaded = new Set<string>();
   let directory: string;
   /** Runs loaders: the dev server itself, or in a build a server started for that. */
   let server: ViteDevServer | undefined;
   let queue = Promise.resolve();
   /** Whether a pass is queued but has not started, which the next change then need not queue again. */
   let queued = false;
-  /** When the latest pass started. Once the queue is idle, every load has used its entry since then. */
-  let started = 0;
+  /** Whether a load of the latest pass failed, which leaves the entries in place. */
   let failed = false;
   /** Set once the dev server closes, after which a running pass stops and nothing is pruned. */
   let closing = false;
-  let timer: NodeJS.Timeout | undefined;
 
   /** The directories discovery scans, with patterns relative to each: the root, and publicDir. */
   let trees: Tree[];
@@ -85,18 +78,14 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
 
   async function run({ importer, source, name, args }: Load): Promise<void> {
     if (!server) {
-      shared.running = true;
-      try {
-        server = await createServer({
-          configFile: config.configFile ?? false,
-          root: config.root,
-          mode: config.mode,
-          logLevel: 'warn',
-          server: { middlewareMode: true, hmr: false, ws: false, watch: null },
-        });
-      } finally {
-        shared.running = false;
-      }
+      server = await createServer({
+        configFile: config.configFile ?? false,
+        root: config.root,
+        mode: config.mode,
+        logLevel: 'warn',
+        server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+        plugins: [{ name: warmServerMarker }],
+      });
     }
     const resolved = await server.environments.ssr.pluginContainer.resolveId(source, importer);
     if (!resolved) throw new Error(`vitecache cannot resolve ${source} from ${importer}`);
@@ -125,32 +114,35 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     config.logger[level](`${colors.dim(new Date().toLocaleTimeString())} ${tag} ${message}`);
   }
 
-  /** Runs every load once, one at a time. Hits are silent; a load that computes is logged, and announced when slow. */
+  /**
+   * Runs every load once, one at a time, then, unless a load failed, deletes the entries none of them loaded. A load
+   * still running after half a second is announced.
+   */
   async function pass(): Promise<void> {
     queued = false;
-    started = Date.now();
+    failed = false;
+    loaded.clear();
     for (const load of [...files.values()].flat()) {
       if (closing) return;
       const file = normalizePath(relative(config.root, load.importer));
       const where = `${load.name} ${colors.dim(`${file}:${load.position}`)}`;
-      const start = Date.now();
-      const saves = shared.saves;
       const slow = setTimeout(() => log(`${colors.yellow('computing')} ${where}…`), 500);
       try {
         await run(load);
       } catch (error) {
         failed = true;
         log(`${colors.red('failed')} ${where}\n${stack(error)}`, 'error');
-        continue;
       } finally {
         clearTimeout(slow);
       }
-      const computed = shared.saves - saves;
-      if (!computed) continue;
-      const time = Date.now() - start;
-      const took = time < 1000 ? `${time} ms` : `${(time / 1000).toFixed(1)} s`;
-      const entries = computed > 1 ? `, ${computed} entries` : '';
-      log(`${colors.green('computed')} ${where} ${colors.dim(`in ${took}${entries}`)}`);
+    }
+    // Another plugin in this process may have replaced the global since, as a restarted dev server does.
+    if (failed || closing || globalThis.vitecache?.loaded !== loaded) return;
+    try {
+      await prune();
+    } catch (error) {
+      if (config.command === 'build') throw error;
+      log(`${colors.red('cannot prune')} ${stack(error)}`, 'error');
     }
   }
 
@@ -171,23 +163,16 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     } while (current !== queue);
   }
 
-  /** Deletes the entries no load used since `before`. */
-  async function prune(before: number): Promise<void> {
+  /** Deletes the entries whose keys are not in `loaded`. */
+  async function prune(): Promise<void> {
     const names = await readdir(directory).catch((error: unknown) => {
       if (missing(error)) return [];
       throw error;
     });
     for (const name of names) {
       const key = /^([a-f0-9]{64})\.(?:bin|json)$/.exec(name)?.[1];
-      if (key && (shared.used.get(key) ?? 0) < before) await rm(join(directory, name), { force: true });
+      if (key && !loaded.has(key)) await rm(join(directory, name), { force: true });
     }
-  }
-
-  /** Prunes in development, once idle: entries the latest pass used stay, others until `pruneAfter` past their use. */
-  async function expire(): Promise<void> {
-    await idle();
-    if (closing) return;
-    await prune(Math.min(started, Date.now() - pruneAfter));
   }
 
   async function scanAll(): Promise<void> {
@@ -197,6 +182,9 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
 
   return {
     name: 'vitecache',
+    // The warm server's copy of the plugin stays out, since this one warms.
+    apply: (config) =>
+      !config.plugins?.some((plugin) => plugin && 'name' in plugin && plugin.name === warmServerMarker),
     async configResolved(resolved) {
       config = resolved;
       if (!config.publicDir) throw new Error('vitecache requires Vite publicDir');
@@ -205,7 +193,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
         throw new Error('vitecache requires a Vite publicDir that does not contain the root');
       // Normalized, as are the files hotUpdate is given.
       directory = normalizePath(join(config.publicDir, cacheName));
-      shared.project = { root: config.root, publicDir: config.publicDir };
+      globalThis.vitecache = { root: config.root, publicDir: config.publicDir, loaded };
       const outputs = [config.build.outDir, config.publicDir].map((path) =>
         relative(config.root, resolve(config.root, path)),
       );
@@ -227,22 +215,14 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     async buildStart() {
       if (config.command !== 'build' || this.environment.name !== 'client') return;
-      const start = Date.now();
-      failed = false;
       try {
         await scanAll();
         await warm();
         if (failed) throw new Error('vitecache: warming failed, see the errors above.');
-        const saves = shared.saves;
-        await warm();
-        if (failed) throw new Error('vitecache: warming failed, see the errors above.');
-        if (shared.saves !== saves)
-          throw new Error('vitecache: a second warming saved entries again, so their keys are not stable.');
       } finally {
         await server?.close();
         server = undefined;
       }
-      await prune(start);
     },
     configureServer(devServer) {
       server = devServer;
@@ -264,8 +244,7 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       const report = (error: unknown) => log(stack(error), 'error');
       // Queued, so that requests wait for the scan too.
       queue = queue.then(scanAll).catch(report);
-      void warm().then(expire).catch(report);
-      timer = setInterval(() => void expire().catch(report), pruneAfter);
+      void warm().catch(report);
     },
     async hotUpdate({ file }) {
       if (this.environment.name !== 'client' || file.startsWith(directory)) return;
@@ -279,7 +258,6 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
     },
     async closeBundle() {
       closing = true;
-      clearInterval(timer);
       await idle();
     },
   };

@@ -4,9 +4,8 @@ import { createRequire } from 'node:module';
 import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
-import { missing, read } from './disk.js';
+import { cacheName, missing, read } from './disk.js';
 import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
-import { cacheName, shared, type Project } from './shared.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
 /** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
@@ -51,9 +50,12 @@ async function packageVersion(root: string, name: string): Promise<string | unde
   return undefined;
 }
 
-/** The project at `root`; without one, the plugin's while it runs in this process, else the working directory. */
-function project(root?: string): Project {
-  if (root === undefined && shared.project) return shared.project;
+/**
+ * The root and publicDir at `root`; without one, the plugin's once it has run in this process, else the working
+ * directory's.
+ */
+function project(root?: string): { root: string; publicDir: string } {
+  if (root === undefined && globalThis.vitecache) return globalThis.vitecache;
   root ??= process.cwd();
   return { root, publicDir: `${root}/public` };
 }
@@ -61,7 +63,7 @@ function project(root?: string): Project {
 /**
  * The URL to read a public file at: for a root-absolute path such as `/tree/model.glts`, the `file:` URL of that file
  * below publicDir, without the path's query and hash. Any other URL is returned unchanged. The publicDir is the
- * plugin's while it runs in this process, else `public` below the working directory.
+ * plugin's once it has run in this process, else `public` below the working directory.
  */
 export function publicURL(url: string): string {
   if (!url.startsWith('/') || url.startsWith('//')) return url;
@@ -109,7 +111,7 @@ export class CacheEntry {
 
   /** The saved bytes while every input they were built from is unchanged, otherwise undefined. */
   async load(): Promise<Uint8Array | undefined> {
-    shared.used.set(this.#key, Date.now());
+    globalThis.vitecache?.loaded.add(this.#key);
     this.#loaded = await this.#record(this.#inputs);
     const metadata = await read(join(this.#directory, `${this.#key}.json`));
     if (!metadata) return undefined;
@@ -128,7 +130,6 @@ export class CacheEntry {
     const inputs = [...this.#loaded, ...(await this.#record(saved))];
     const missing = inputs.find((input) => input.state === undefined);
     if (missing) throw new Error(`vitecache input has no file or package: ${JSON.stringify(missing.dependency)}`);
-    shared.saves++;
     // Atomic writes, so that a reader sees the old file or the new one.
     await mkdir(this.#directory, { recursive: true });
     await writeFileAtomic(

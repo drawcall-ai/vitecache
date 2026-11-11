@@ -8,6 +8,7 @@ import { key } from '../src/entry.js';
 const servers: ViteDevServer[] = [];
 const roots: string[] = [];
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await Promise.all(servers.splice(0).map((server) => server.close()));
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -17,7 +18,7 @@ afterEach(async () => {
  * logs each run outside the watched files, and one that keys on the URL it loads, resolved against its path, and saves
  * that path, with the public file as an input.
  */
-async function project(main: string, version = "'echo@1'", options = ''): Promise<string> {
+async function project(main: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
   roots.push(root);
   await mkdir(join(root, 'src'));
@@ -26,7 +27,7 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
     join(root, 'vite.config.js'),
     `
     import { vitecache } from ${JSON.stringify(resolve('src/vite.ts'))};
-    export default { logLevel: 'silent', plugins: [vitecache(${options})] };`,
+    export default { logLevel: 'silent', plugins: [vitecache()] };`,
   );
   await writeFile(join(root, 'index.html'), '<script type="module" src="/src/main.js"></script>');
   await writeFile(join(root, 'input.txt'), 'a');
@@ -39,7 +40,7 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
       async loadAsync(value) {
         await appendFile(new URL('../node_modules/runs.txt', import.meta.url), 'run\\n');
         const dependencies = { value: { value }, input: { path: 'input.txt' } };
-        const entry = new CacheEntry({ version: ${version}, dependencies });
+        const entry = new CacheEntry({ version: 'echo@1', dependencies });
         if (await entry.load()) return;
         const input = await readFile(new URL('../input.txt', import.meta.url), 'utf8');
         await entry.save(new TextEncoder().encode(JSON.stringify(value) + input));
@@ -102,6 +103,8 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
   );
   expect(contents.sort()).toEqual(['"x"a', '2a', '{"n":-1,"list":[true,null,"x"]}a']);
   expect(await readdir(join(root, 'public/_vitecache'))).toEqual(deployed);
+  // The warm server's own copy of the plugin warms nothing.
+  expect(await runs(root)).toBe(3);
 });
 
 test.each(['/', '/app/', './'])("a build with base %s warms public scripts, setting loaders' paths", async (base) => {
@@ -132,15 +135,15 @@ test('a build fails on a load in a public script whose loader has no setPath', a
   await mkdir(join(root, 'public/tree'), { recursive: true });
   const imported = "import { CachedEchoLoader as Loader } from '../../src/loader.js';";
   await writeFile(join(root, 'public/tree/index.glts'), script(imported));
+  const stale = join(root, 'public/_vitecache', `${'0'.repeat(64)}.bin`);
+  await mkdir(join(root, 'public/_vitecache'));
+  await writeFile(stale, 'stale');
   const errors: string[] = [];
   const customLogger = { ...createLogger('silent'), error: (message: string) => void errors.push(message) };
   await expect(build({ root, customLogger })).rejects.toThrow(/warming failed/);
+  // A failed warming deletes nothing.
+  expect(await readFile(stale, 'utf8')).toBe('stale');
   expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
-});
-
-test('a build fails when a second warming saves again', async () => {
-  const root = await project('new Echo().loadAsync(1);', 'String(Math.random())');
-  await expect(build({ root })).rejects.toThrow(/keys are not stable/);
 });
 
 test.each([
@@ -154,8 +157,8 @@ test.each([
   await expect(build({ root: await project(main) })).rejects.toThrow(error);
 });
 
-test('the dev server warms every load at startup, holds requests for it, warms after changes, and prunes', async () => {
-  const root = await project('new Echo().loadAsync(1);', "'echo@1'", '{ pruneAfter: 300 }');
+test('the dev server warms every load at startup, holds requests for it, and warms and prunes after changes', async () => {
+  const root = await project('new Echo().loadAsync(1);');
   const cache = join(root, 'public/_vitecache');
   const stale = `${'0'.repeat(64)}.bin`;
   await mkdir(cache, { recursive: true });
@@ -172,20 +175,38 @@ test('the dev server warms every load at startup, holds requests for it, warms a
   const response = await fetch(url(1));
   expect(response.headers.get('content-type')).toBe('application/octet-stream');
   expect(await response.text()).toBe('1a');
-  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(stale));
+  expect(await readdir(cache)).not.toContain(stale);
   // The save's own files do not warm again.
   await new Promise((done) => setTimeout(done, 500));
   expect(await runs(root)).toBe(1);
   await writeFile(join(root, 'input.txt'), 'b');
   await vi.waitFor(async () => expect(await (await fetch(url(1))).text()).toBe('1b'));
-  // An edited load replaces its entry, which stays for pruneAfter.
+  // An edited load replaces its entry, which the pass that warms it deletes.
   await writeFile(
     join(root, 'src/main.js'),
     "import { CachedEchoLoader as Echo } from './loader.js';\nnew Echo().loadAsync(2);",
   );
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
-  expect(await readdir(cache)).toContain(`${name(1)}.bin`);
-  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(`${name(1)}.bin`), { timeout: 2000 });
+  expect(await readdir(cache)).not.toContain(`${name(1)}.bin`);
+});
+
+test('a dev server whose global another plugin took over prunes nothing', async () => {
+  const root = await project('new Echo().loadAsync(1);');
+  await writeFile(join(root, '.gitignore'), 'public/_vitecache/*\n');
+  const server = await createServer({ root, server: { port: 0 } });
+  servers.push(server);
+  await server.listen();
+  const name = key({ version: 'echo@1', dependencies: { value: { value: 1 }, input: { path: 'input.txt' } } });
+  const url = `${server.resolvedUrls?.local[0]}_vitecache/${name}.bin`;
+  expect(await (await fetch(url)).text()).toBe('1a');
+  const current = globalThis.vitecache;
+  if (!current) throw new Error('the plugin set no global');
+  vi.stubGlobal('vitecache', { ...current, loaded: new Set() });
+  const stale = join(root, 'public/_vitecache', `${'0'.repeat(64)}.bin`);
+  await writeFile(stale, 'stale');
+  await writeFile(join(root, 'input.txt'), 'b');
+  await vi.waitFor(async () => expect(await (await fetch(url)).text()).toBe('1b'));
+  expect(await readFile(stale, 'utf8')).toBe('stale');
 });
 
 test('the dev server scans a public script added while it runs', async () => {
