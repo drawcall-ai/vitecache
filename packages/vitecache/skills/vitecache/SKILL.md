@@ -86,7 +86,7 @@ The plugin finds loads by scanning the project's JavaScript and TypeScript files
 
 The plugin repeats each load in Node by importing the loader's module through Vite's SSR loading. That module and its top-level imports must load without browser globals, and whatever the loader does after loading, such as decoding, runs in Node too. A build loads the Vite config file again to run the loaders, so configure plugins they rely on there rather than inline in a programmatic build.
 
-In development the plugin warms every load at startup and again after every file change, and the page's cache requests wait for it, so the browser normally hits. It deletes entries no load uses: at startup, those left from earlier sessions, and later, an entry replaced by an edit once it has gone unused for `pruneAfter`, a minute by default, so that undoing the edit within that time reuses it. A build warms every load once, then deletes every entry the build did not use, so the deployment holds exactly what the app requests.
+In development the plugin warms every load at startup and again after every file change, and the page's cache requests wait for it, so the browser normally hits. After each pass without a failed load, it deletes the entries that pass did not load, so undoing an edit computes its result again. A build warms every load once and deletes the same way, so the deployment holds exactly what the app requests.
 
 Development and builds announce a load still running after half a second, by loader and source location.
 

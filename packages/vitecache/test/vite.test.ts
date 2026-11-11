@@ -17,7 +17,7 @@ afterEach(async () => {
  * logs each run outside the watched files, and one that keys on the URL it loads, resolved against its path, and saves
  * that path, with the public file as an input.
  */
-async function project(main: string, options = ''): Promise<string> {
+async function project(main: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
   roots.push(root);
   await mkdir(join(root, 'src'));
@@ -26,7 +26,7 @@ async function project(main: string, options = ''): Promise<string> {
     join(root, 'vite.config.js'),
     `
     import { vitecache } from ${JSON.stringify(resolve('src/vite.ts'))};
-    export default { logLevel: 'silent', plugins: [vitecache(${options})] };`,
+    export default { logLevel: 'silent', plugins: [vitecache()] };`,
   );
   await writeFile(join(root, 'index.html'), '<script type="module" src="/src/main.js"></script>');
   await writeFile(join(root, 'input.txt'), 'a');
@@ -102,6 +102,8 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
   );
   expect(contents.sort()).toEqual(['"x"a', '2a', '{"n":-1,"list":[true,null,"x"]}a']);
   expect(await readdir(join(root, 'public/_vitecache'))).toEqual(deployed);
+  // The warm server's own copy of the plugin warms nothing.
+  expect(await runs(root)).toBe(3);
 });
 
 test.each(['/', '/app/', './'])("a build with base %s warms public scripts, setting loaders' paths", async (base) => {
@@ -149,8 +151,8 @@ test.each([
   await expect(build({ root: await project(main) })).rejects.toThrow(error);
 });
 
-test('the dev server warms every load at startup, holds requests for it, warms after changes, and prunes', async () => {
-  const root = await project('new Echo().loadAsync(1);', '{ pruneAfter: 300 }');
+test('the dev server warms every load at startup, holds requests for it, and warms and prunes after changes', async () => {
+  const root = await project('new Echo().loadAsync(1);');
   const cache = join(root, 'public/_vitecache');
   const stale = `${'0'.repeat(64)}.bin`;
   await mkdir(cache, { recursive: true });
@@ -167,20 +169,19 @@ test('the dev server warms every load at startup, holds requests for it, warms a
   const response = await fetch(url(1));
   expect(response.headers.get('content-type')).toBe('application/octet-stream');
   expect(await response.text()).toBe('1a');
-  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(stale));
+  expect(await readdir(cache)).not.toContain(stale);
   // The save's own files do not warm again.
   await new Promise((done) => setTimeout(done, 500));
   expect(await runs(root)).toBe(1);
   await writeFile(join(root, 'input.txt'), 'b');
   await vi.waitFor(async () => expect(await (await fetch(url(1))).text()).toBe('1b'));
-  // An edited load replaces its entry, which stays for pruneAfter.
+  // An edited load replaces its entry, which the pass that warms it deletes.
   await writeFile(
     join(root, 'src/main.js'),
     "import { CachedEchoLoader as Echo } from './loader.js';\nnew Echo().loadAsync(2);",
   );
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
-  expect(await readdir(cache)).toContain(`${name(1)}.bin`);
-  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(`${name(1)}.bin`), { timeout: 2000 });
+  expect(await readdir(cache)).not.toContain(`${name(1)}.bin`);
 });
 
 test('the dev server scans a public script added while it runs', async () => {

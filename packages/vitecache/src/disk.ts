@@ -1,5 +1,8 @@
 import { readFile } from 'node:fs/promises';
 
+/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
+export const cacheName = '_vitecache';
+
 export function missing(error: unknown): boolean {
   return error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
 }

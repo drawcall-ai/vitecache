@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -7,7 +7,10 @@ import { key, type CacheEntryOptions, type SaveOptions } from '../src/entry.js';
 import { CacheEntry, publicURL } from '../src/node.js';
 
 const roots: string[] = [];
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+afterEach(async () => {
+  vi.unstubAllGlobals();
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 async function project(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-'));
@@ -74,6 +77,20 @@ test('a file: URL input invalidates like a path, and is saved as one', async () 
   expect(await load(options)).toBeUndefined();
 });
 
+test('while the plugin warms, entries use its project and record their keys as loaded', async () => {
+  const root = await project();
+  const loaded = new Set<string>();
+  vi.stubGlobal('vitecache', { root, publicDir: join(root, 'static'), loaded });
+  const options = { version: 'warm@1' };
+  await compute(options, [1]);
+  expect(await readdir(join(root, 'static/_vitecache'))).toHaveLength(2);
+  expect(loaded).toEqual(new Set([key(options)]));
+  expect(publicURL('/tree/model.glts')).toBe(pathToFileURL(join(root, 'static/tree/model.glts')).href);
+  const explicit = await project();
+  await compute({ root: explicit, version: 'warm@1' }, [1]);
+  expect(await readdir(join(explicit, 'public/_vitecache'))).toHaveLength(2);
+});
+
 test('without the plugin, publicURL maps a root-absolute path below the working directory\'s public', () => {
   const file = pathToFileURL(join(process.cwd(), 'public/tree/a b.glts')).href;
   expect(publicURL('/tree/a%20b.glts')).toBe(file);
@@ -96,13 +113,4 @@ test('save requires a load first and inputs that exist', async () => {
   await expect(
     compute({ root, version: 'missing@1', dependencies: { source: { path: 'missing.txt' } } }, [1]),
   ).rejects.toThrow(/no file/);
-});
-
-test('loads after an earlier vitecache version in the process left its own shared state', async () => {
-  const root = await project();
-  vi.stubGlobal('vitecache', { loaded: new Set(), saved: new Set() });
-  vi.resetModules();
-  const { CacheEntry: Fresh } = await import('../src/node.js');
-  expect(await new Fresh({ root, version: 'restart@1' }).load()).toBeUndefined();
-  vi.unstubAllGlobals();
 });
