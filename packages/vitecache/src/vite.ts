@@ -36,15 +36,6 @@ function below(directory: string, file: string): string | undefined {
   return file.startsWith(`${directory}/`) ? file.slice(directory.length + 1) : undefined;
 }
 
-declare global {
-  /**
-   * Set by the vitecache plugin for the loaders it warms in this Node process, when its config resolves: its project,
-   * and the keys loaded since its latest pass started. Global, because Vite's module runner gives the loaders their own
-   * copy of vitecache.
-   */
-  var vitecache: { root: string; publicDir: string; loaded: Set<string> } | undefined;
-}
-
 /** Marks the server the plugin warms with in a build, which loads the config, and so the plugin, again. */
 const warmServerMarker = 'vitecache:warm';
 
@@ -52,14 +43,12 @@ const warmServerMarker = 'vitecache:warm';
  * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
  * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
  * load uses. In development it scans and warms at startup and again after every file change, and holds cache requests
- * until warming finishes. A build scans and warms once. After a pass without failures, it deletes every entry the pass
- * did not load.
+ * until warming finishes. A build scans and warms once.
  */
 export function vitecache(): Plugin {
   /** The loads each scanned file holds. */
   const files = new Map<string, Load[]>();
   let config: ResolvedConfig;
-  /** The keys loaded since the latest pass started, which loaders add to through globalThis.vitecache. */
   const loaded = new Set<string>();
   let directory: string;
   /** Runs loaders: the dev server itself, or in a build a server started for that. */
@@ -126,8 +115,8 @@ export function vitecache(): Plugin {
   }
 
   /**
-   * Runs every load once, one at a time, then deletes the entries none of them loaded. A load still running after half
-   * a second is announced.
+   * Runs every load once, one at a time, then, unless a load failed, deletes the entries none of them loaded. A load
+   * still running after half a second is announced.
    */
   async function pass(): Promise<void> {
     queued = false;
@@ -147,9 +136,10 @@ export function vitecache(): Plugin {
         clearTimeout(slow);
       }
     }
-    if (failed) return;
+    // Another plugin in this process may have replaced the global since, as a restarted dev server does.
+    if (failed || closing || globalThis.vitecache?.loaded !== loaded) return;
     try {
-      await prune(loaded);
+      await prune();
     } catch (error) {
       if (config.command === 'build') throw error;
       log(`${colors.red('cannot prune')} ${stack(error)}`, 'error');
@@ -174,7 +164,7 @@ export function vitecache(): Plugin {
   }
 
   /** Deletes the entries whose keys are not in `loaded`. */
-  async function prune(loaded: Set<string>): Promise<void> {
+  async function prune(): Promise<void> {
     const names = await readdir(directory).catch((error: unknown) => {
       if (missing(error)) return [];
       throw error;

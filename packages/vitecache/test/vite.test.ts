@@ -134,9 +134,14 @@ test('a build fails on a load in a public script whose loader has no setPath', a
   await mkdir(join(root, 'public/tree'), { recursive: true });
   const imported = "import { CachedEchoLoader as Loader } from '../../src/loader.js';";
   await writeFile(join(root, 'public/tree/index.glts'), script(imported));
+  const stale = join(root, 'public/_vitecache', `${'0'.repeat(64)}.bin`);
+  await mkdir(join(root, 'public/_vitecache'));
+  await writeFile(stale, 'stale');
   const errors: string[] = [];
   const customLogger = { ...createLogger('silent'), error: (message: string) => void errors.push(message) };
   await expect(build({ root, customLogger })).rejects.toThrow(/warming failed/);
+  // A failed warming deletes nothing.
+  expect(await readFile(stale, 'utf8')).toBe('stale');
   expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
 });
 

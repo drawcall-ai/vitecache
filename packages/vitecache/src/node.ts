@@ -50,7 +50,10 @@ async function packageVersion(root: string, name: string): Promise<string | unde
   return undefined;
 }
 
-/** The root and publicDir at `root`; without one, the plugin's in this process, else the working directory's. */
+/**
+ * The root and publicDir at `root`; without one, the plugin's once it has run in this process, else the working
+ * directory's.
+ */
 function project(root?: string): { root: string; publicDir: string } {
   if (root === undefined && globalThis.vitecache) return globalThis.vitecache;
   root ??= process.cwd();
@@ -60,7 +63,7 @@ function project(root?: string): { root: string; publicDir: string } {
 /**
  * The URL to read a public file at: for a root-absolute path such as `/tree/model.glts`, the `file:` URL of that file
  * below publicDir, without the path's query and hash. Any other URL is returned unchanged. The publicDir is the
- * plugin's while it runs in this process, else `public` below the working directory.
+ * plugin's once it has run in this process, else `public` below the working directory.
  */
 export function publicURL(url: string): string {
   if (!url.startsWith('/') || url.startsWith('//')) return url;
