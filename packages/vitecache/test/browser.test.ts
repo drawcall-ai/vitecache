@@ -37,3 +37,17 @@ test('save writes nothing and warns once per version', async () => {
   expect(warn).toHaveBeenCalledOnce();
   expect(fetch).not.toHaveBeenCalled();
 });
+
+/** The skill's public loader key path: below the app's base for a served URL, as is for Node's path from setPath. */
+function publicPath(served: string, basePath: string): string {
+  const base = served.startsWith('/') ? '/' : new URL('..', new URL(basePath, served)).pathname;
+  return `/${new URL(served, 'http://node').pathname.slice(base.length)}`;
+}
+
+test("the skill's public loader keys alike on Node's path and the browser's served URL", () => {
+  const keyed = (path: string) => key({ version: 'model@1', dependencies: { path: { value: path } } });
+  const node = keyed(publicPath('/@scope/my%20tree/./model.glts', '/app/_vitecache/'));
+  expect(keyed(publicPath('http://host/app/@scope/my%20tree/model.glts', '/app/_vitecache/'))).toBe(node);
+  expect(keyed(publicPath('http://host/@scope/my%20tree/model.glts', '/_vitecache/'))).toBe(node);
+  expect(node).toBe(keyed('/@scope/my%20tree/model.glts'));
+});

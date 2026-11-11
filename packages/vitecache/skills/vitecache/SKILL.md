@@ -41,21 +41,24 @@ A `{ path }` is relative to the project root, never to the importing module; on 
 
 When inputs are only discovered while computing, such as the textures a model references, pass them to `save()` as its `dependencies`, like a compiler's depfile. They are checked on every load without being part of the key.
 
-A load in a public script, such as a `.glts` asset installed into `public/`, may pass URLs relative to the script. Before it, the plugin calls the loader's `setPath` with the script's URL directory without Vite's base, such as `/tree/` for `public/tree/index.glts` or `/my%20tree/` for `public/my tree/`, and fails the load if the loader has none. Key on the URL resolved against that path, so that entries do not depend on where the app is deployed, and read the file at `publicURL()` of it, recording that URL on `save()`:
+A load in a public script, such as a `.glts` asset installed into `public/`, may pass URLs relative to the script. Before it, the plugin calls the loader's `setPath` with the script's URL directory without Vite's base, such as `/tree/` for `public/tree/index.glts`, and fails the load if the loader has none. In the browser nothing calls `setPath`, and the script's `LoadingManager`, such as the one glts provides, resolves URLs to their served URLs instead. Key on the path below the app's base, which both give, and read at `publicURL()` of the resolved URL, which in Node is the file's `file:` URL:
 
 ```ts
+import { Loader } from "three"
 import { CacheEntry, publicURL } from "vitecache"
 
-export class CachedModelLoader {
-  path = "/"
-  setPath(path: string) { this.path = path }
+const basePath = "/_vitecache/" // the cache's URL, with the app's base
 
+export class CachedModelLoader extends Loader {
   async loadAsync(url: string): Promise<Model> {
-    const resolved = new URL(url, new URL(this.path, "http://host")).pathname
-    const entry = new CacheEntry({ version: "model@1", dependencies: { url: { value: resolved } } })
+    const served = this.manager.resolveURL(this.path + url)
+    // In Node, the path setPath gave has no base; a served URL has the app's.
+    const base = served.startsWith("/") ? "/" : new URL("..", new URL(basePath, served)).pathname
+    const path = `/${new URL(served, "http://node").pathname.slice(base.length)}`
+    const entry = new CacheEntry({ version: "model@1", basePath, dependencies: { path: { value: path } } })
     let bytes = await entry.load()
     if (bytes === undefined) {
-      const file = publicURL(resolved)
+      const file = publicURL(served)
       bytes = encodeModel(await buildModel(await read(file)))
       await entry.save(bytes, { dependencies: [{ path: file }] })
     }
@@ -64,7 +67,7 @@ export class CachedModelLoader {
 }
 ```
 
-In Node, `file` is a `file:` URL, which Node's `fetch` refuses, so `read` must handle it. In the browser nothing calls `setPath`: resolve URLs as the `LoadingManager` running the script does, read the file at that served URL, and key on its path with the origin and the app's base stripped, or the browser misses and computes each time.
+Node's `fetch` refuses `file:` URLs, so `read` must handle them.
 
 ## Using loaders
 

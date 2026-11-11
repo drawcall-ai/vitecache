@@ -112,9 +112,9 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       // path leaves out Vite's base, so that keys do not depend on where the app is deployed.
       if (!('setPath' in instance) || typeof instance.setPath !== 'function')
         throw new Error(`${name} has no setPath method, which a load in a public file needs`);
-      // Encoded, as the browser serves it.
-      const names = path.split('/').slice(0, -1);
-      instance.setPath(`/${names.map((name) => `${encodeURIComponent(name)}/`).join('')}`);
+      // Encoded by the URL parser, as a browser requests it; it would read these as delimiters or escapes.
+      const folder = path.slice(0, path.lastIndexOf('/') + 1).replace(/[%#?\\]/g, encodeURIComponent);
+      instance.setPath(new URL(`/${folder}`, 'http://host').pathname);
     }
     await instance.loadAsync(...args);
   }

@@ -106,24 +106,25 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
 
 test.each(['/', '/app/', './'])("a build with base %s warms public scripts, setting loaders' paths", async (base) => {
   const root = await project('');
-  // A browser requests a directory with a space encoded, and so keys on the encoded path.
-  await mkdir(join(root, 'public/my tree'), { recursive: true });
-  await writeFile(join(root, 'public/my tree/index.glts'), script(locatedImport));
-  await writeFile(join(root, 'public/my tree/model.glts'), '');
-  await writeFile(join(root, 'public/helper.bin'), '');
+  // A browser requests a space encoded and an @ literal, and so keys on that path.
+  const tree = join(root, 'public/@scope/my tree');
+  await mkdir(tree, { recursive: true });
+  await writeFile(join(tree, 'index.glts'), script(locatedImport.replace('../../', '../../../')));
+  await writeFile(join(tree, 'model.glts'), '');
+  await writeFile(join(root, 'public/@scope/helper.bin'), '');
   await writeFile(
-    join(root, 'public/my tree/helper.js'),
-    "import { CachedLocatedLoader as L } from '../../src/located.js'; new L().loadAsync('../helper.bin');",
+    join(tree, 'helper.js'),
+    "import { CachedLocatedLoader as L } from '../../../src/located.js'; new L().loadAsync('../helper.bin');",
   );
   // The cache directory is not scanned: this misuse would fail the build.
   await mkdir(join(root, 'public/_vitecache'));
   await writeFile(join(root, 'public/_vitecache/misuse.js'), "import { CachedLocatedLoader as L } from 'x'; [L];");
   await build({ root, base });
-  const urls = ['/my%20tree/model.glts', '/helper.bin'];
+  const urls = ['/@scope/my%20tree/model.glts', '/@scope/helper.bin'];
   const contents = await Promise.all(
     urls.map((url) => readFile(join(root, 'dist/_vitecache', `${located(url)}.bin`), 'utf8')),
   );
-  expect(contents).toEqual(['/my%20tree/', '/my%20tree/']);
+  expect(contents).toEqual(['/@scope/my%20tree/', '/@scope/my%20tree/']);
 });
 
 test('a build fails on a load in a public script whose loader has no setPath', async () => {
