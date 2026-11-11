@@ -30,7 +30,8 @@ export function discover(code: string, importer: string): Load[] {
   const fail = (message: string, offset: number): never => {
     throw new Error(`${message} at ${importer}:${at(offset)}`);
   };
-  const { program, errors } = parseSync(importer, code);
+  // .glts asset scripts are TypeScript.
+  const { program, errors } = parseSync(importer, code, importer.endsWith('.glts') ? { lang: 'ts' } : undefined);
   if (errors[0]) fail(errors[0].message, errors[0].labels[0]?.start ?? 0);
   const imports = new Map<string, { source: string; name: string }>();
   const namespaces = new Map<string, string>();
