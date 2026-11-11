@@ -151,6 +151,8 @@ test('the dev server warms every load at startup, holds requests for it, warms a
   const stale = `${'0'.repeat(64)}.bin`;
   await mkdir(cache, { recursive: true });
   await writeFile(join(cache, stale), 'stale');
+  // Otherwise the plugin appends to it, and the watcher can report that write as a change after starting.
+  await writeFile(join(root, '.gitignore'), 'public/_vitecache/*\n');
   const server = await createServer({ root, server: { port: 0 } });
   servers.push(server);
   await server.listen();
