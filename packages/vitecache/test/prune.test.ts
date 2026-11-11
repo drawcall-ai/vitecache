@@ -20,6 +20,12 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+async function saved(options: ConstructorParameters<typeof CacheEntry>[0], bytes: number[]): Promise<void> {
+  const entry = new CacheEntry(options);
+  await entry.load();
+  await entry.save(new Uint8Array(bytes));
+}
+
 async function temporaryRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-prune-'));
   roots.push(root);
@@ -29,8 +35,8 @@ async function temporaryRoot(): Promise<string> {
 test('deletes only entries unused since the cutoff and abandoned staged files', async () => {
   const root = await temporaryRoot();
   const directory = join(root, 'public/_vitecache');
-  await new CacheEntry({ root, version: 'used@1' }).save(new Uint8Array([1]));
-  await new CacheEntry({ root, version: 'unused@1' }).save(new Uint8Array([2]));
+  await saved({ root, version: 'used@1' }, [1]);
+  await saved({ root, version: 'unused@1' }, [2]);
   const unused = key('unused@1', {});
   const used = key('used@1', {});
   await writeFile(join(directory, `${unused}.bin.0b5e-crashed.tmp`), 'partial');
@@ -55,7 +61,7 @@ test('rejects an invalid date, and finds nothing to prune in an absent cache dir
 
 test('a filesystem that cannot record use still serves hits and warns once', async () => {
   const root = await temporaryRoot();
-  await new CacheEntry({ root, version: 'read-only@1' }).save(new Uint8Array([1]));
+  await saved({ root, version: 'read-only@1' }, [1]);
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
   readOnly.value = true;
   try {

@@ -1,7 +1,7 @@
 {
   "name": "vitecache",
-  "version": "0.3.0",
-  "description": "Persistent binary caching for expensive computation in browsers and Node.",
+  "version": "0.4.0",
+  "description": "Persistent binary caching for expensive computation, saved in Node and read in browsers and Node.",
   "type": "module",
   "license": "MIT",
   "repository": {

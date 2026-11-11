@@ -1,108 +1,100 @@
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as disk from './disk.js';
-import { ChangedDependenciesError, equalHashes, hashableDependencies, hashes, MissingDependencyError, resolvedDependencies } from './dependencies.js';
+import { dependency, isHashable, resolvedDependencies } from './dependencies.js';
 import { contentHash, fileHash } from './hash.js';
 import { packageVersion } from './packages.js';
-import type { Backend, CacheEntryOptions, Dependencies, Hashable, Hashes, Snapshot, Stored } from './types.js';
+import type { CacheEntryOptions, Dependencies, Hashable, Resolved } from './types.js';
 
+/** A file or package a result was built from, with the hash of its state when it was read. */
+export interface Input {
+  dependency: Hashable;
+  hash: string;
+}
+
+/** An entry's metadata file: the hash of its bytes and the inputs that must still be current for them to be used. */
 interface Metadata {
   contentHash: string;
-  dependencies: Hashes;
-  saved: Dependencies<Hashable>;
-  /** The saved dependencies' hashes when the entry was saved. */
-  savedHashes: Hashes;
+  inputs: Input[];
 }
+
+const sha256 = /^[a-f0-9]{64}$/;
 
 /** A metadata file vitecache wrote; any failure to read it names the file, since no request caused it. */
 function metadata(bytes: Uint8Array, file: string): Metadata | undefined {
   try {
     const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    if (typeof value !== 'object' || value === null || !('contentHash' in value) || !('dependencies' in value)) {
-      throw new Error('Expected contentHash and dependencies.');
-    }
-    const hash = value.contentHash;
-    if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) throw new Error('Expected a content hash.');
-    const validated = hashes(value.dependencies);
-    // Metadata without saved dependencies: all that vitecache 0.1 wrote, and what 0.2 wrote for entries that had none.
-    if (!('saved' in value)) return { contentHash: hash, dependencies: validated, saved: {}, savedHashes: {} };
-    // vitecache 0.2 kept each saved dependency with its hash in one record. Its entry misses until a save replaces it.
-    if (!('savedHashes' in value)) return undefined;
-    return { contentHash: hash, dependencies: validated, saved: hashableDependencies(value.saved), savedHashes: hashes(value.savedHashes) };
+    if (typeof value !== 'object' || value === null) throw new Error('Expected an object.');
+    // Earlier vitecache versions wrote other metadata. Their entries miss until a save replaces them.
+    if (!('inputs' in value)) return undefined;
+    if (!('contentHash' in value) || typeof value.contentHash !== 'string' || !sha256.test(value.contentHash)) throw new Error('Expected a content hash.');
+    if (!Array.isArray(value.inputs)) throw new Error('Expected inputs.');
+    const inputs = value.inputs.map((input: unknown): Input => {
+      if (typeof input !== 'object' || input === null || !('dependency' in input) || !('hash' in input)) throw new Error('Expected an input.');
+      const declared = dependency(input.dependency);
+      if (!isHashable(declared) || typeof input.hash !== 'string' || !sha256.test(input.hash)) throw new Error('Expected a file or package input with its hash.');
+      return { dependency: declared, hash: input.hash };
+    });
+    return { contentHash: value.contentHash, inputs };
   } catch (cause) {
     throw new Error(`Invalid vitecache metadata: ${file}`, { cause });
   }
 }
 
-/** A stored entry as storage reads it, its hashes always known. */
-export interface Found extends Stored {
-  /** The entity tag's opaque value: it changes whenever the entry's bytes or dependency hashes do. */
-  tag: string;
-  hashes: Hashes;
-}
+export type Storage = ReturnType<typeof createStorage>;
 
-export interface Storage extends Backend {
-  /** Reads a valid entry and records its use for prune(). */
-  load(key: string): Promise<Found | undefined>;
-}
-
-function matches(current: Snapshot, expected: Hashes): boolean {
-  return current.status === 'current' && equalHashes(current.hashes, expected);
-}
-
-export function createStorage(options: Pick<CacheEntryOptions, 'root' | 'basePath'>): Storage {
+/** The cache directory on disk, which the Node CacheEntry writes and the Vite plugin serves. */
+export function createStorage(options: Pick<CacheEntryOptions, 'root' | 'basePath'>) {
   const { root, directory } = disk.location(options);
 
-  async function snapshot(dependencies: Dependencies<Hashable>): Promise<Exclude<Snapshot, { status: 'unchecked' }>> {
-    const entries = await Promise.all(Object.entries(dependencies).map(async ([name, dependency]) => {
-      if (dependency.package === undefined) return [name, await fileHash(resolve(root, dependency.path))] as const;
-      const version = await packageVersion(root, dependency.package);
-      return [name, version === undefined ? undefined : contentHash(new TextEncoder().encode(version))] as const;
-    }));
-    const present: [string, string][] = [];
-    for (const [name, hash] of entries) {
-      if (hash === undefined) return { status: 'missing', message: `Missing file or package dependency: ${name}` };
-      present.push([name, hash]);
-    }
-    return { status: 'current', hashes: Object.fromEntries(present) };
+  /** The hash of a file's contents or of a package's installed version, or undefined when there is none. */
+  async function hash(dependency: Hashable): Promise<string | undefined> {
+    if (dependency.package === undefined) return fileHash(resolve(root, dependency.path));
+    const version = await packageVersion(root, dependency.package);
+    return version === undefined ? undefined : contentHash(new TextEncoder().encode(version));
   }
 
-  async function load(key: string): Promise<Found | undefined> {
-    const file = join(directory, `${key}.json`);
-    const raw = await disk.load(file);
-    if (raw === undefined) return undefined;
-    const parsed = metadata(raw, file);
-    if (!parsed || !matches(await snapshot(parsed.saved), parsed.savedHashes)) return undefined;
-    const bytes = await disk.load(join(directory, `${key}.bin`));
-    if (bytes === undefined || contentHash(bytes) !== parsed.contentHash) return undefined;
-    // The metadata file's modification time is the entry's last use. The bytes keep theirs, so static hosts keep their
-    // validators.
-    await disk.touch(file);
-    return { tag: contentHash(raw), hashes: parsed.dependencies, bytes };
+  async function current(inputs: readonly Input[]): Promise<boolean> {
+    const hashes = await Promise.all(inputs.map((input) => hash(input.dependency)));
+    return hashes.every((value, index) => value === inputs[index]?.hash);
   }
 
   return {
-    async canSave() { return true; },
-    async resolve(declared: Dependencies) {
-      return resolvedDependencies(Object.fromEntries(await Promise.all(Object.entries(declared).map(async ([name, dependency]) => {
-        if (dependency.url === undefined) return [name, dependency];
-        const url = new URL(dependency.url);
+    hash,
+
+    /** Local file: URLs as project-root-relative paths. */
+    async resolve(declared: Dependencies): Promise<Dependencies<Resolved>> {
+      return resolvedDependencies(Object.fromEntries(await Promise.all(Object.entries(declared).map(async ([name, item]) => {
+        if (item.url === undefined) return [name, item];
+        const url = new URL(item.url);
         if (url.protocol !== 'file:') {
           throw new Error('Node file dependency URLs must use file:. Use a project-root-relative path for Vite-served files.');
         }
         return [name, { path: await disk.rootRelative(root, fileURLToPath(url)) }];
       }))));
     },
-    snapshot,
-    load,
-    async save(key, value, { checked, expected, saved }) {
-      const current = await snapshot(saved);
-      if (current.status !== 'current') throw new MissingDependencyError(`Cannot save a cache entry with a missing saved dependency. ${current.message}`);
+
+    /** The entry's bytes while every input is current, recording its use for prune(); otherwise undefined. */
+    async load(key: string): Promise<{ bytes: Uint8Array; tag: string } | undefined> {
+      const file = join(directory, `${key}.json`);
+      const raw = await disk.load(file);
+      if (raw === undefined) return undefined;
+      const parsed = metadata(raw, file);
+      if (!parsed || !await current(parsed.inputs)) return undefined;
+      const bytes = await disk.load(join(directory, `${key}.bin`));
+      // Bytes from a save that the metadata does not describe yet, or one interrupted between the two writes.
+      if (bytes === undefined || contentHash(bytes) !== parsed.contentHash) return undefined;
+      // The metadata file's modification time is the entry's last use. The bytes keep theirs, so static hosts keep their
+      // validators.
+      await disk.touch(file);
+      // The entity tag changes whenever the bytes or the inputs do.
+      return { bytes, tag: contentHash(raw) };
+    },
+
+    async save(key: string, bytes: Uint8Array, inputs: readonly Input[]): Promise<void> {
       await disk.ignore(root, directory);
-      await disk.save(join(directory, `${key}.bin`), value, async () => {
-        if (!matches(await snapshot(checked), expected)) throw new ChangedDependenciesError();
-      });
-      const record: Metadata = { contentHash: contentHash(value), dependencies: expected, saved, savedHashes: current.hashes };
+      await disk.save(join(directory, `${key}.bin`), bytes);
+      const record: Metadata = { contentHash: contentHash(bytes), inputs: [...inputs] };
       await disk.save(join(directory, `${key}.json`), new TextEncoder().encode(JSON.stringify(record)));
     },
   };

@@ -4,19 +4,14 @@ import type { Plugin, ResolvedConfig, ViteDevServer } from 'vite';
 import * as disk from '../disk.js';
 import { createStorage } from '../storage.js';
 import type { Storage } from '../storage.js';
-import { ChangedDependenciesError, dependencies, hashableDependencies, hashes, MissingDependencyError } from '../dependencies.js';
-import { confine, RequestError, resolveDependencies } from './resolve.js';
+import { dependencies, MissingDependencyError } from '../dependencies.js';
+import type { Dependencies } from '../types.js';
+import { RequestError, resolveDependencies } from './resolve.js';
 import { assetUrl, publicPaths } from './manifest.js';
 
 export interface VitecacheOptions {
   /** Cache directory relative to the Vite project root; must be inside publicDir. */
   basePath?: string;
-}
-
-function status(error: unknown): number {
-  if (error instanceof RequestError) return error.status;
-  if (error instanceof ChangedDependenciesError) return 409;
-  return 500;
 }
 
 function allowed(request: IncomingMessage): boolean {
@@ -31,51 +26,28 @@ function allowed(request: IncomingMessage): boolean {
   }
 }
 
-async function body(request: IncomingMessage): Promise<Uint8Array> {
+/** The `dependencies` of a same-origin POST's JSON body. */
+async function posted(request: IncomingMessage): Promise<Dependencies> {
+  if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
   const chunks: Uint8Array[] = [];
   for await (const value of request) {
     const chunk: unknown = value;
     if (!Buffer.isBuffer(chunk)) throw new RequestError(400, 'Expected a binary request body');
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks);
-}
-
-function parse(value: string): unknown {
+  let body: unknown;
   try {
-    return JSON.parse(value);
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw new RequestError(400, 'Expected valid JSON');
   }
-}
-
-function parseRequest<T>(value: unknown, parser: (value: unknown) => T): T {
+  if (typeof body !== 'object' || body === null || !('dependencies' in body)) throw new RequestError(400, 'Expected dependencies');
   try {
-    return parser(value);
+    return dependencies(body.dependencies);
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
     throw new RequestError(400, error.message);
   }
-}
-
-/** A save body: a 4-byte big-endian metadata length, that much JSON metadata, then the cached bytes. */
-function upload(bytes: Uint8Array): { metadata: Record<string, unknown>; value: Uint8Array } {
-  if (bytes.byteLength < 4) throw new RequestError(400, 'Expected a metadata length');
-  const end = 4 + new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0);
-  if (end > bytes.byteLength) throw new RequestError(400, 'Truncated save metadata');
-  const metadata = parse(new TextDecoder().decode(bytes.subarray(4, end)));
-  if (typeof metadata !== 'object' || metadata === null || !('checked' in metadata) || !('expected' in metadata) || !('saved' in metadata)) {
-    throw new RequestError(400, 'Expected checked, expected, and saved');
-  }
-  return { metadata, value: bytes.subarray(end) };
-}
-
-/** The `dependencies` of a same-origin POST's JSON body. */
-async function posted(request: IncomingMessage): Promise<unknown> {
-  if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
-  const value = parse(new TextDecoder().decode(await body(request)));
-  if (typeof value !== 'object' || value === null || !('dependencies' in value)) throw new RequestError(400, 'Expected dependencies');
-  return value.dependencies;
 }
 
 function sendJson(response: ServerResponse, value: unknown): void {
@@ -83,29 +55,17 @@ function sendJson(response: ServerResponse, value: unknown): void {
   response.end(JSON.stringify(value));
 }
 
-async function respond(
-  request: IncomingMessage,
-  response: ServerResponse,
-  name: string,
-  storage: Storage,
-  server: ViteDevServer,
-): Promise<void> {
-  const root = server.config.root;
+/** Serves the cache directory: discovery, URL resolution, and entries that are hits only while their inputs are current. */
+async function respond(request: IncomingMessage, response: ServerResponse, name: string, storage: Storage, server: ViteDevServer): Promise<void> {
   response.setHeader('Cache-Control', 'no-store');
   if (name === '__vitecache' && request.method === 'GET') {
     sendJson(response, { vitecache: 1 });
     return;
   }
   if (name === '__vitecache/resolve' && request.method === 'POST') {
-    const deps = parseRequest(await posted(request), dependencies);
+    const declared = await posted(request);
     const origin = `${server.config.server.https ? 'https' : 'http'}://${request.headers.host}`;
-    sendJson(response, { dependencies: await resolveDependencies(server, deps, origin) });
-    return;
-  }
-  if (name === '__vitecache/snapshot' && request.method === 'POST') {
-    const deps = parseRequest(await posted(request), hashableDependencies);
-    await confine(root, deps);
-    sendJson(response, await storage.snapshot(deps));
+    sendJson(response, { dependencies: await resolveDependencies(server, declared, origin) });
     return;
   }
   if (!/^[a-f0-9]{64}\.bin$/.test(name)) {
@@ -113,27 +73,13 @@ async function respond(
     response.end();
     return;
   }
-  const key = name.slice(0, -4);
-  if (request.method === 'PUT') {
-    if (!allowed(request)) throw new RequestError(403, 'Cross-origin requests are forbidden');
-    const { metadata, value } = upload(await body(request));
-    const checked = parseRequest(metadata.checked, hashableDependencies);
-    const expected = parseRequest(metadata.expected, hashes);
-    const saved = parseRequest(metadata.saved, hashableDependencies);
-    await confine(root, checked);
-    await confine(root, saved);
-    await storage.save(key, value, { checked, expected, saved });
-    response.statusCode = 204;
-    response.end();
-    return;
-  }
   if (request.method !== 'GET') {
     response.statusCode = 405;
-    response.setHeader('Allow', 'GET, PUT');
+    response.setHeader('Allow', 'GET');
     response.end();
     return;
   }
-  const stored = await storage.load(key);
+  const stored = await storage.load(name.slice(0, -4));
   if (stored === undefined) {
     // Browsers log every 404 fetch as an error, and a miss is an expected answer.
     response.statusCode = 204;
@@ -144,7 +90,6 @@ async function respond(
   response.setHeader('Cache-Control', 'no-cache');
   const tag = `"${stored.tag}"`;
   response.setHeader('ETag', tag);
-  response.setHeader('X-Vitecache-Dependencies', encodeURIComponent(JSON.stringify(stored.hashes)));
   if (request.headers['if-none-match'] === tag) {
     response.statusCode = 304;
     response.end();
@@ -155,7 +100,7 @@ async function respond(
   response.end(stored.bytes);
 }
 
-/** Persist and validate entries in development; preserve asset URL mappings in production builds. */
+/** Serves checked entries in development; preserves asset URL mappings in production builds. */
 export function vitecache(options: VitecacheOptions = {}): Plugin {
   let state: { storage: Storage; root: string; prefix: string; directory: string; config: ResolvedConfig; cachePath: string } | undefined;
   return {
@@ -211,7 +156,7 @@ export function vitecache(options: VitecacheOptions = {}): Plugin {
             sendJson(response, { status: 'missing', message: error.message });
             return;
           }
-          response.statusCode = status(error);
+          response.statusCode = error instanceof RequestError ? error.status : 500;
           response.setHeader('Content-Type', 'text/plain');
           response.end(error instanceof Error ? error.message : 'vitecache request failed');
         });

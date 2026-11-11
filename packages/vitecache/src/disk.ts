@@ -78,12 +78,12 @@ export async function load(path: string): Promise<Uint8Array | undefined> {
   }
 }
 
-export async function save(path: string, value: Uint8Array, beforeCommit?: () => Promise<void>): Promise<void> {
+/** Writes `value` to `path` atomically: a reader sees the old file or the new one, never part of it. */
+export async function save(path: string, value: Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, value, { flag: 'wx' });
-    await beforeCommit?.();
     await rename(temporary, path);
   } finally {
     try {

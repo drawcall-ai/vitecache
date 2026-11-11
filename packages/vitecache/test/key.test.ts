@@ -1,14 +1,14 @@
 import { expect, test } from 'vitest';
 import { CacheEntry } from '../src/node.js';
 import { key } from '../src/key.js';
-import { resolvedDependencies } from '../src/dependencies.js';
+import { dependencies } from '../src/dependencies.js';
 
 test('keys canonicalize named dependencies and JSON values while preserving dependency kinds', () => {
   const first = key('mesh@1', { options: { value: { b: [2, 1], a: { x: true, y: null } } }, model: { path: 'missing.glb' }, algorithm: { path: 'src/a.ts' }, engine: { package: 'layout-engine' } });
   const second = key('mesh@1', { engine: { package: 'layout-engine' }, algorithm: { path: 'src/a.ts' }, model: { path: 'missing.glb' }, options: { value: { a: { y: null, x: true }, b: [2, 1] } } });
   expect(first).toBe(second);
   expect(first).toMatch(/^[a-f0-9]{64}$/);
-  expect(resolvedDependencies({ source: { path: './src/a.ts' } })).toEqual({ source: { path: 'src/a.ts' } });
+  expect(dependencies({ source: { path: './src/a.ts' } })).toEqual({ source: { path: 'src/a.ts' } });
   const variants = [
     key('mesh@1', { ratio: { value: 0.5 }, model: { path: 'model.glb' } }),
     key('mesh@2', { ratio: { value: 0.5 }, model: { path: 'model.glb' } }),

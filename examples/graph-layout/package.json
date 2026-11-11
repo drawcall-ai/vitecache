@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "pnpm precompute && vite",
     "precompute": "node --import tsx src/compute.ts",
     "build": "pnpm precompute && vite build",
     "preview": "vite preview",

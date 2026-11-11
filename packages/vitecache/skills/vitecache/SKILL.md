@@ -1,6 +1,6 @@
 ---
 name: vitecache
-description: Cache expensive computation with vitecache in browsers or Node, connect browser saves to a Vite development server, reuse cached bytes in deployed apps, and prune entries no longer used.
+description: Cache expensive computation with vitecache: compute and save results in Node, read them in Node and browsers through a Vite development server or a deployed app, and prune entries no longer used.
 ---
 
 # vitecache
@@ -11,7 +11,9 @@ Give dependencies stable names. Use `{ path: "src/simplify.ts" }` for a project-
 
 Reordering JSON object properties or dependency declarations does not change identity; array order matters. Changing a dependency name, JSON value, resolved path, or package name does. File contents and installed package versions invalidate the existing result in Node and through the Vite plugin; installation paths do not affect identity.
 
-Load once and compute on a miss. Reuse that entry when saving: loading captures file contents and package versions before computation, allowing saving to reject a result if those dependencies changed in the meantime. A new entry or a save without a preceding load cannot establish that relationship. Entries containing only value dependencies can save directly. If saving rejects with `ChangedDependenciesError`, load again and recompute before retrying. Use a separate entry for each concurrent computation.
+Load, compute on a miss, then save with the same entry: `save()` requires a preceding `load()`, because it records the file contents and package versions as that load found them. A dependency that changes during the computation therefore makes the next load miss rather than serve a stale result. Use a separate entry for each concurrent computation.
+
+Only Node writes entries. Run the same code in browsers: there `load()` reads the deployed or dev-served cache, and `save()` writes nothing and warns once per version, so a browser that misses computes the result for itself each time. Fill the cache by running the computations in Node, for example in a precompute script that the build runs first.
 
 ```ts
 import { CacheEntry } from "vitecache"
@@ -48,7 +50,7 @@ if (bytes === undefined) {
 }
 ```
 
-Use the Vite plugin when browser computation should produce reusable project files:
+Add the Vite plugin when browsers load entries. During development it serves the cache directory and checks every file and package an entry was built from before serving it, and it resolves served URLs to the project paths Node uses, so both derive the same keys:
 
 ```ts
 import { defineConfig } from "vite"
@@ -57,11 +59,11 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-Generate caches during development or from Node before building when deployed users should download precomputed results. Include the generated public files in the build or deployment even when Git ignores them. The plugin writes files during development; it does not supply a production write server. Browsers without the plugin assume files and package versions unchanged, saved dependencies included, so regenerate affected caches before deployment. The plugin answers a missing entry without an HTTP error, but a static host answers it with 404, which the browser console shows; each one marks a result the deployment lacks, so precompute what deployed users will request.
+Generate caches in Node before building, and include the generated public files in the build or deployment even when Git ignores them. A deployed app serves entries without checking their dependencies, so regenerate affected caches before deployment. The plugin answers a missing entry without an HTTP error, but a static host answers it with 404, which the browser console shows; each one marks a result the deployment lacks, so precompute what deployed users will request.
 
 Browsers keep loaded entries in their HTTP cache and revalidate them before each use, because an entry's file name stays the same when its contents change. In deployments, serve the cache directory with `ETag` or `Last-Modified`, as most static hosts do, so unchanged entries cost a `304` instead of a download. Do not mark cache files immutable.
 
-The cache directory keeps every entry ever saved, and the build deploys all of them. Loads and saves in Node or through the development server mark an entry as used; `prune` deletes entries not used since a time. Run it after a pass that loads everything the deployment needs, such as a precompute script:
+The cache directory keeps every entry ever saved, and the build deploys all of them. Loads and saves in Node, and loads through the development server, mark an entry as used; `prune` deletes entries not used since a time. Run it after a pass that loads everything the deployment needs, such as a precompute script:
 
 ```ts
 import { prune } from "vitecache/prune"
@@ -71,6 +73,6 @@ await precompute() // loads or saves every entry the app uses
 await prune({ before: start })
 ```
 
-Entries that only browsers compute in development count as used only when a page loads them through the dev server, so prune with an older cutoff, such as a week ago, when no single pass loads everything.
+When no single pass loads everything, prune with an older cutoff, such as a week ago.
 
 For custom locations, coordinate the filesystem destination with the URL used by browser callers. A filesystem path and a browser URL are different values. When deploying below a URL prefix, include that prefix in the browser cache path; the client does not infer Vite's base URL. Node jobs should select the same project root as the Vite app when launched from a different working directory.
