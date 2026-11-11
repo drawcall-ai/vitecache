@@ -3,6 +3,9 @@ declare global {
   var vitecache: Shared | undefined;
 }
 
+/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
+export const cacheName = '_vitecache';
+
 /** A project root and its publicDir, which holds the cache directory. */
 export interface Project {
   root: string;

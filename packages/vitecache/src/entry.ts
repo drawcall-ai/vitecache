@@ -5,8 +5,8 @@ import { configure } from 'safe-stable-stringify';
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 /**
- * A file, relative to the project root or, passed to save(), as a `file:` URL, or an installed package, whose current
- * state an entry is checked against.
+ * A file (a root-relative path, or on save() a `file:` URL) or an installed package, whose current state an entry is
+ * checked against.
  */
 export type Input = { readonly path: string } | { readonly package: string };
 

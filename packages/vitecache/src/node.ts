@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
 import { missing, read } from './disk.js';
 import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
-import { shared, type Project } from './shared.js';
+import { cacheName, shared, type Project } from './shared.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
 /** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
@@ -60,12 +60,15 @@ function project(root?: string): Project {
 
 /**
  * The URL to read a public file at: for a root-absolute path such as `/tree/model.glts`, the `file:` URL of that file
- * below publicDir, without the path's query and hash. Any other URL is returned unchanged.
+ * below publicDir, without the path's query and hash. Any other URL is returned unchanged. The publicDir is the
+ * plugin's while it runs in this process, else `public` below the working directory.
  */
 export function publicURL(url: string): string {
   if (!url.startsWith('/') || url.startsWith('//')) return url;
-  const path = url.replace(/[?#].*/s, '');
-  return new URL(`.${path}`, pathToFileURL(`${project().publicDir}/`)).href;
+  const base = pathToFileURL(`${project().publicDir}/`);
+  const file = new URL(`.${url.replace(/[?#].*/s, '')}`, base);
+  if (!file.href.startsWith(base.href)) throw new Error(`vitecache publicURL: ${url} lies outside publicDir`);
+  return file.href;
 }
 
 /** A cached result in the cache directory on disk, which Node computes and saves for every environment. */
@@ -83,12 +86,13 @@ export class CacheEntry {
     this.#inputs = dependencies.filter((dependency): dependency is Input => !('value' in dependency));
     const { root, publicDir } = project(options.root);
     this.#root = resolve(root);
-    this.#directory = resolve(publicDir, '_vitecache');
+    this.#directory = resolve(publicDir, cacheName);
   }
 
-  /** An input's file, named by a `file:` URL or a path relative to the root. */
-  #file(path: string): string {
-    return path.startsWith('file:') ? fileURLToPath(path) : resolve(this.#root, path);
+  /** An input as recorded: a `file:` URL becomes a root-relative path, so that metadata holds no machine's paths. */
+  #portable(input: Input): Input {
+    if (!('path' in input) || !input.path.startsWith('file:')) return input;
+    return { path: relative(this.#root, fileURLToPath(input.path)).split(sep).join('/') };
   }
 
   #record(inputs: readonly Input[]): Promise<Recorded[]> {
@@ -97,7 +101,7 @@ export class CacheEntry {
         dependency,
         state:
           'path' in dependency
-            ? await fileHash(this.#file(dependency.path))
+            ? await fileHash(resolve(this.#root, dependency.path))
             : await packageVersion(this.#root, dependency.package),
       })),
     );
@@ -120,7 +124,8 @@ export class CacheEntry {
   /** Saves the result computed after load(), built from the inputs as that load() found them, plus `dependencies`. */
   async save(value: Uint8Array, options: SaveOptions = {}): Promise<void> {
     if (!this.#loaded) throw new Error('Call CacheEntry.load() before computing the result to save.');
-    const inputs = [...this.#loaded, ...(await this.#record(options.dependencies ?? []))];
+    const saved = (options.dependencies ?? []).map((input) => this.#portable(input));
+    const inputs = [...this.#loaded, ...(await this.#record(saved))];
     const missing = inputs.find((input) => input.state === undefined);
     if (missing) throw new Error(`vitecache input has no file or package: ${JSON.stringify(missing.dependency)}`);
     shared.saves++;

@@ -6,7 +6,7 @@ import { glob } from 'tinyglobby';
 import { createServer, normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
 import { missing, read } from './disk.js';
 import { discover, type Load } from './discover.js';
-import { shared } from './shared.js';
+import { cacheName, shared } from './shared.js';
 
 /** Adds the cache directory to the project's .gitignore, since its entries are generated. */
 async function ignore(root: string, directory: string): Promise<void> {
@@ -21,10 +21,8 @@ function stack(error: unknown): string {
   return error instanceof Error ? (error.stack ?? error.message) : String(error);
 }
 
-/** The JavaScript and TypeScript modules discovery scans, as Tailwind scans for class names. */
-const modules = 'js,jsx,ts,tsx,mjs,mts';
-/** The cache directory's name in publicDir, which is also its URL below Vite's base. */
-const cacheName = '_vitecache';
+/** The extensions of the JavaScript and TypeScript modules discovery scans, as Tailwind scans for class names. */
+const extensions = 'js,jsx,ts,tsx,mjs,mts';
 
 /** A directory discovery scans, with patterns relative to it. */
 interface Tree {
@@ -114,12 +112,13 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       // path leaves out Vite's base, so that keys do not depend on where the app is deployed.
       if (!('setPath' in instance) || typeof instance.setPath !== 'function')
         throw new Error(`${name} has no setPath method, which a load in a public file needs`);
-      instance.setPath(`/${path.slice(0, path.lastIndexOf('/') + 1)}`);
+      // Encoded, as the browser serves it.
+      const names = path.split('/').slice(0, -1);
+      instance.setPath(`/${names.map((name) => `${encodeURIComponent(name)}/`).join('')}`);
     }
     await instance.loadAsync(...args);
   }
 
-  /** Runs every load once, one at a time, logging progress and failures. */
   /** Logs as Vite does with a timestamp, but tagged [vitecache], since Vite's own timestamp option tags lines [vite]. */
   function log(message: string, level: 'info' | 'error' = 'info'): void {
     const tag = colors.bold(level === 'info' ? colors.cyan('[vitecache]') : colors.red('[vitecache]'));
@@ -218,11 +217,11 @@ export function vitecache({ pruneAfter = 60_000 }: VitecacheOptions = {}): Plugi
       });
       trees = [
         // Not dependencies or outputs. An output at the root itself excludes nothing, since the root holds the sources.
-        tree(config.root, `**/*.{${modules}}`, [
+        tree(config.root, `**/*.{${extensions}}`, [
           '**/node_modules/**',
           ...outputs.filter(Boolean).map((path) => `${normalizePath(path)}/**`),
         ]),
-        tree(config.publicDir, `**/*.{glts,${modules}}`, ['**/node_modules/**', `${cacheName}/**`]),
+        tree(config.publicDir, `**/*.{glts,${extensions}}`, ['**/node_modules/**', `${cacheName}/**`]),
       ];
       await ignore(config.root, directory);
     },

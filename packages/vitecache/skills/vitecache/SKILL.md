@@ -41,9 +41,30 @@ A `{ path }` is relative to the project root, never to the importing module; on 
 
 When inputs are only discovered while computing, such as the textures a model references, pass them to `save()` as its `dependencies`, like a compiler's depfile. They are checked on every load without being part of the key.
 
-A load in a public script, such as a `.glts` asset installed into `public/`, may pass URLs relative to the script. Before such a load the plugin calls the loader's `setPath` with the script's directory below `publicDir`, without Vite's base, so that keys do not depend on where the app is deployed: `/tree/` for `public/tree/index.glts`. A loader without `setPath` fails the load, and loads in app sources get no `setPath`. Resolve relative URLs against that path, and let the resolved path, such as `/tree/model.glts`, select the result. Read the file at `publicURL(path)` from `vitecache`, which in Node is the `file:` URL of that file below `publicDir`, and record that URL as a `{ path }` input on `save()`: among the entry's dependencies it is refused, since it would change the key. Node's `fetch` refuses `file:` URLs, so read it there with a file-aware read such as `readFile(new URL(url))`.
+A load in a public script, such as a `.glts` asset installed into `public/`, may pass URLs relative to the script. Before it, the plugin calls the loader's `setPath` with the script's URL directory without Vite's base, such as `/tree/` for `public/tree/index.glts` or `/my%20tree/` for `public/my tree/`, and fails the load if the loader has none. Key on the URL resolved against that path, so that entries do not depend on where the app is deployed, and read the file at `publicURL()` of it, recording that URL on `save()`:
 
-In the browser, `publicURL()` returns its argument unchanged, so read a public file at its served URL, as the `LoadingManager` running the script resolves it, such as the one glts gives a `.glts` script. Select the result by the same base-free path as in Node, or the browser misses and computes each time: strip the origin and the app's base, the entry's `basePath` without `_vitecache/`, from the served URL.
+```ts
+import { CacheEntry, publicURL } from "vitecache"
+
+export class CachedModelLoader {
+  path = "/"
+  setPath(path: string) { this.path = path }
+
+  async loadAsync(url: string): Promise<Model> {
+    const resolved = new URL(url, new URL(this.path, "http://host")).pathname
+    const entry = new CacheEntry({ version: "model@1", dependencies: { url: { value: resolved } } })
+    let bytes = await entry.load()
+    if (bytes === undefined) {
+      const file = publicURL(resolved)
+      bytes = encodeModel(await buildModel(await read(file)))
+      await entry.save(bytes, { dependencies: [{ path: file }] })
+    }
+    return decodeModel(bytes)
+  }
+}
+```
+
+In Node, `file` is a `file:` URL, which Node's `fetch` refuses, so `read` must handle it. In the browser nothing calls `setPath`: resolve URLs as the `LoadingManager` running the script does, read the file at that served URL, and key on its path with the origin and the app's base stripped, or the browser misses and computes each time.
 
 ## Using loaders
 
@@ -56,7 +77,7 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
+A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, which the plugin calls itself for loads in public scripts, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
 
 The plugin finds loads by scanning the project's JavaScript and TypeScript files, as Tailwind scans for class names, and matches the loader's imported name through aliases and namespace imports. It also scans the `.glts` scripts and every JavaScript and TypeScript module in `publicDir`, so assets installed there are warmed too. It skips `node_modules` and the build output, so a library's loaders are warmed only where the app uses them. It does not read `.vue` or `.svelte` files, and it warms a load in a file the app never imports, such as a test. Since variables are matched by name in the module, give a loader variable a name no other variable in that module uses.
 
@@ -72,4 +93,4 @@ Browsers only read entries. A browser that misses, for a load the plugin could n
 
 Entries keep their file names when their contents change, so browsers revalidate them before each use. Serve the cache directory with `ETag` or `Last-Modified`, as most static hosts do, and do not mark it immutable. When deploying below a URL prefix, pass that prefix with the cache path as `basePath`, such as `/app/_vitecache/`; the entry does not infer Vite's base.
 
-The plugin adds the cache directory, `public/_vitecache/`, to `.gitignore`. A Node script outside Vite can use the same loaders. Its entries use `public/_vitecache/` below the working directory, or below `root` when passed.
+The plugin adds the cache directory, `public/_vitecache/`, to `.gitignore`. A Node script outside Vite can use the same loaders. Its entries use `public/_vitecache/` below the working directory, or below `root` when passed, while `publicURL()` always reads `public/` below the working directory.

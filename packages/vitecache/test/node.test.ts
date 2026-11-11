@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, expect, test, vi } from 'vitest';
-import type { CacheEntryOptions, SaveOptions } from '../src/entry.js';
+import { key, type CacheEntryOptions, type SaveOptions } from '../src/entry.js';
 import { CacheEntry, publicURL } from '../src/node.js';
 
 const roots: string[] = [];
@@ -62,11 +62,13 @@ test('inputs passed to save are checked without changing the key', async () => {
   expect(await load(options)).toBeUndefined();
 });
 
-test('a file: URL input invalidates like a path', async () => {
+test('a file: URL input invalidates like a path, and is saved as one', async () => {
   const root = await project();
   await writeFile(join(root, 'model.glts'), 'a');
   const options = { root, version: 'url@1' };
   await compute(options, [1], { dependencies: [{ path: pathToFileURL(join(root, 'model.glts')).href }] });
+  const metadata = await readFile(join(root, 'public/_vitecache', `${key(options)}.json`), 'utf8');
+  expect(metadata).toContain('{"path":"model.glts"}');
   expect(await load(options)).toEqual(new Uint8Array([1]));
   await writeFile(join(root, 'model.glts'), 'b');
   expect(await load(options)).toBeUndefined();
@@ -78,6 +80,7 @@ test('without the plugin, publicURL maps a root-absolute path below the working 
   expect(publicURL('/tree/a%20b.glts?v=1#top')).toBe(file);
   for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts'])
     expect(publicURL(url)).toBe(url);
+  for (const url of ['/../x', '/tree/%2e%2e/../x']) expect(() => publicURL(url)).toThrow(/outside publicDir/);
 });
 
 test('a file: URL among the declared dependencies is refused, since it belongs on save()', () => {

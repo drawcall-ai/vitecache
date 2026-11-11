@@ -14,8 +14,8 @@ afterEach(async () => {
 
 /**
  * A project whose page runs `main`, with a cached loader that saves its arguments and the contents of input.txt, and
- * logs each run outside the watched files, and one that saves the URL it loads, resolved against its path, with that
- * public file as an input.
+ * logs each run outside the watched files, and one that keys on the URL it loads, resolved against its path, and saves
+ * that path, with the public file as an input.
  */
 async function project(main: string, version = "'echo@1'", options = ''): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'vitecache-vite-'));
@@ -57,7 +57,7 @@ async function project(main: string, version = "'echo@1'", options = ''): Promis
         const entry = new CacheEntry({ version: 'located@1', dependencies: { url: { value: resolved } } });
         if (await entry.load()) return;
         // Saving fails unless publicURL found the file below the plugin's publicDir.
-        await entry.save(new TextEncoder().encode(resolved), { dependencies: [{ path: publicURL(resolved) }] });
+        await entry.save(new TextEncoder().encode(this.path), { dependencies: [{ path: publicURL(resolved) }] });
       }
     }`,
   );
@@ -106,23 +106,24 @@ test('a build warms every call, deploys the entries, and prunes the rest', async
 
 test.each(['/', '/app/', './'])("a build with base %s warms public scripts, setting loaders' paths", async (base) => {
   const root = await project('');
-  await mkdir(join(root, 'public/tree'), { recursive: true });
-  await writeFile(join(root, 'public/tree/index.glts'), script(locatedImport));
-  await writeFile(join(root, 'public/tree/model.glts'), '');
+  // A browser requests a directory with a space encoded, and so keys on the encoded path.
+  await mkdir(join(root, 'public/my tree'), { recursive: true });
+  await writeFile(join(root, 'public/my tree/index.glts'), script(locatedImport));
+  await writeFile(join(root, 'public/my tree/model.glts'), '');
   await writeFile(join(root, 'public/helper.bin'), '');
   await writeFile(
-    join(root, 'public/tree/helper.js'),
+    join(root, 'public/my tree/helper.js'),
     "import { CachedLocatedLoader as L } from '../../src/located.js'; new L().loadAsync('../helper.bin');",
   );
   // The cache directory is not scanned: this misuse would fail the build.
   await mkdir(join(root, 'public/_vitecache'));
   await writeFile(join(root, 'public/_vitecache/misuse.js'), "import { CachedLocatedLoader as L } from 'x'; [L];");
   await build({ root, base });
-  const urls = ['/tree/model.glts', '/helper.bin'];
+  const urls = ['/my%20tree/model.glts', '/helper.bin'];
   const contents = await Promise.all(
     urls.map((url) => readFile(join(root, 'dist/_vitecache', `${located(url)}.bin`), 'utf8')),
   );
-  expect(contents).toEqual(urls);
+  expect(contents).toEqual(['/my%20tree/', '/my%20tree/']);
 });
 
 test('a build fails on a load in a public script whose loader has no setPath', async () => {
@@ -195,7 +196,7 @@ test('the dev server scans a public script added while it runs', async () => {
   await writeFile(join(root, 'public/tree/model.glts'), '');
   await writeFile(join(root, 'public/tree/index.glts'), script(locatedImport));
   const entry = `${server.resolvedUrls?.local[0]}_vitecache/${located('/tree/model.glts')}.bin`;
-  await vi.waitFor(async () => expect(await (await fetch(entry)).text()).toBe('/tree/model.glts'));
+  await vi.waitFor(async () => expect(await (await fetch(entry)).text()).toBe('/tree/'));
 });
 
 test('a build refuses a publicDir that contains the root', async () => {
