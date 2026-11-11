@@ -1,56 +1,49 @@
 ---
 name: vitecache
-description: Cache expensive computation with vitecache: compute and save results in Node, read them in Node and browsers through a Vite development server or a deployed app, and prune entries no longer used.
+description: Cache expensive computation with vitecache: wrap it in a cached loader that the Vite plugin finds and computes in Node during development and builds, so browsers and Node read the saved bytes instead of recomputing.
 ---
 
 # vitecache
 
-Use vitecache when recomputing a result costs more than reading its encoded bytes. The application owns encoding and decoding. Declare every input that affects the computation as a named dependency. Use `{ value }` for JSON data and `{ package: "layout-engine" }` for an installed library. Package dependencies track the named package’s installed version, so declare transitive packages separately when their versions matter. Bump the computation version for changes beyond what the declared dependencies capture, such as a linked workspace package changed without a new version.
+Use vitecache when recomputing a result costs more than reading its encoded bytes. The application owns encoding and decoding.
 
-Give dependencies stable names. Use `{ path: "src/simplify.ts" }` for a project-root-relative path or `{ url: modelUrl }` when you have an asset URL served by the same project origin. Paths resolve from the Node `root` or the Vite project root, never from the importing module, page URL, or cache directory. The Vite plugin resolves served URLs to source paths; Node accepts local file URLs. Keep the plugin in the production build configuration when using served URLs so deployed entries can recover the same source paths. Production mappings cover public files and emitted assets with one backing source. Use `{ path }` when an imported asset is inlined or deduplicated from several source files.
+## Cached loaders
 
-Reordering JSON object properties or dependency declarations does not change identity; array order matters. Changing a dependency name, JSON value, resolved path, or package name does. File contents and installed package versions invalidate the existing result in Node and through the Vite plugin; installation paths do not affect identity.
-
-Load, compute on a miss, then save with the same entry: `save()` requires a preceding `load()`, because it records the file contents and package versions as that load found them. A dependency that changes during the computation therefore makes the next load miss rather than serve a stale result. Use a separate entry for each concurrent computation.
-
-Only Node writes entries. Run the same code in browsers: there `load()` reads the deployed or dev-served cache, and `save()` writes nothing and warns once per version, so a browser that misses computes the result for itself each time. Fill the cache by running the computations in Node, for example in a precompute script that the build runs first.
+Put each computation in an exported class whose name matches `Cached…Loader`, with a `loadAsync` method, as a three.js `Loader` has; extending one works. The plugin constructs it without arguments, so let only `loadAsync`'s arguments select the result: constructor options, such as a `LoadingManager`, must not change the bytes it saves. `loadAsync` creates a `CacheEntry`, loads, computes on a miss, and saves with the same entry. Call `load()` on every call, without a memo in front of it: the plugin keeps entries that loads use, and an entry a memo answers for goes unused and is deleted. `save()` records the inputs as the preceding `load()` found them, so one that changes during the computation makes the next load miss instead of serving a stale result. Import the computation lazily inside the miss branch, so pages that hit never download its code.
 
 ```ts
 import { CacheEntry } from "vitecache"
-import modelUrl from "./models/chair.glb?url"
 
-const entry = new CacheEntry({
-  version: "simplify@2",
-  dependencies: {
-    settings: { value: { ratio: 0.5, preserveUVs: true } },
-    algorithm: { path: "src/simplify.ts" },
-    model: { url: modelUrl },
-  },
-})
-
-let bytes = await entry.load()
-
-if (bytes === undefined) {
-  bytes = encodeMesh(await simplify())
-  await entry.save(bytes)
-}
-
-const mesh = decodeMesh(bytes)
-```
-
-Constructor dependencies select which result an entry holds. When some inputs are only discovered while computing, such as the files a script imported or the textures a model referenced, pass them to `save(bytes, { dependencies })` instead, like a compiler's depfile. Their names stay out of the key, so generated names such as `file:${i}` are fine.
-
-```ts
-const entry = new CacheEntry({ version: "bake@1", dependencies: { scene: { url: sceneUrl } } })
-let bytes = await entry.load()
-if (bytes === undefined) {
-  const { result, files } = await bake(sceneUrl) // files: URLs the bake read
-  bytes = encode(result)
-  await entry.save(bytes, { dependencies: Object.fromEntries(files.map((url, i) => [`file:${i}`, { url }])) })
+export class CachedMeshLoader {
+  async loadAsync(settings: { ratio: number }): Promise<Mesh> {
+    const entry = new CacheEntry({
+      version: "simplify@2",
+      dependencies: {
+        settings: { value: settings },
+        algorithm: { path: "src/simplify.ts" },
+        engine: { package: "meshoptimizer" },
+      },
+    })
+    let bytes = await entry.load()
+    if (bytes === undefined) {
+      const { simplify } = await import("./simplify.ts")
+      bytes = encodeMesh(await simplify(settings))
+      await entry.save(bytes)
+    }
+    return decodeMesh(bytes)
+  }
 }
 ```
 
-Add the Vite plugin when browsers load entries. During development it serves the cache directory and checks every file and package an entry was built from before serving it, and it resolves served URLs to the project paths Node uses, so both derive the same keys:
+Declare every input that affects the result, under a stable name. A `{ value }` is JSON that selects which result the entry holds: changing it, a name, a path or a package name changes the key, while reordering object properties does not. File contents and package versions invalidate the entry without changing its key.
+
+A `{ path }` is relative to the project root, never to the importing module. A `{ package }` tracks only that package's installed version, so declare transitive packages separately when their versions matter. Bump `version` for changes the dependencies do not capture, such as a linked workspace package changed without a new version.
+
+When inputs are only discovered while computing, such as the textures a model references, pass them to `save()` as its `dependencies`, like a compiler's depfile. They are checked on every load without being part of the key.
+
+## Using loaders
+
+Add the plugin:
 
 ```ts
 import { defineConfig } from "vite"
@@ -59,20 +52,20 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-Generate caches in Node before building, and include the generated public files in the build or deployment even when Git ignores them. A deployed app serves entries without checking their dependencies, so regenerate affected caches before deployment. The plugin answers a missing entry without an HTTP error, but a static host answers it with 404, which the browser console shows; each one marks a result the deployment lacks, so precompute what deployed users will request.
+A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
 
-Browsers keep loaded entries in their HTTP cache and revalidate them before each use, because an entry's file name stays the same when its contents change. In deployments, serve the cache directory with `ETag` or `Last-Modified`, as most static hosts do, so unchanged entries cost a `304` instead of a download. Do not mark cache files immutable.
+The plugin finds loads by scanning the project's JavaScript and TypeScript files, as Tailwind scans for class names, and matches the loader's imported name through aliases and namespace imports. It skips `node_modules`, the build output and `publicDir`, so a library's loaders are warmed only where the app uses them. It does not read `.vue` or `.svelte` files, and it warms a load in a file the app never imports, such as a test. Since variables are matched by name in the module, give a loader variable a name no other variable in that module uses.
 
-The cache directory keeps every entry ever saved, and the build deploys all of them. Loads and saves in Node, and loads through the development server, mark an entry as used; `prune` deletes entries not used since a time. Run it after a pass that loads everything the deployment needs, such as a precompute script:
+The plugin repeats each load in Node by importing the loader's module through Vite's SSR loading. That module and its top-level imports must load without browser globals, and whatever the loader does after loading, such as decoding, runs in Node too. A build loads the Vite config file again to run the loaders, so configure plugins they rely on there rather than inline in a programmatic build.
 
-```ts
-import { prune } from "vitecache/prune"
+In development the plugin warms every load at startup and again after every file change, and the page's cache requests wait for it, so the browser normally hits. It deletes entries no load uses: at startup, those left from earlier sessions, and later, an entry replaced by an edit once it has gone unused for `pruneAfter`, a minute by default, so that undoing the edit within that time reuses it. A build warms every load, then repeats them all and fails if that second pass saves anything, which means a key that changes between runs, such as one built from a timestamp. It then deletes every entry the build did not use, so the deployment holds exactly what the app requests.
 
-const start = new Date()
-await precompute() // loads or saves every entry the app uses
-await prune({ before: start })
-```
+Development and builds log each load that computes, by loader and source location, and announce a load still running after half a second; loads that hit are silent.
 
-When no single pass loads everything, prune with an older cutoff, such as a week ago.
+## Browsers and deployment
 
-For custom locations, coordinate the filesystem destination with the URL used by browser callers. A filesystem path and a browser URL are different values. When deploying below a URL prefix, include that prefix in the browser cache path; the client does not infer Vite's base URL. Node jobs should select the same project root as the Vite app when launched from a different working directory.
+Browsers only read entries. A browser that misses, for a load the plugin could not see, computes the result itself each time, and `save()` warns once per version instead of writing. A deployed app serves entries without checking their inputs, so build again after changing them.
+
+Entries keep their file names when their contents change, so browsers revalidate them before each use. Serve the cache directory with `ETag` or `Last-Modified`, as most static hosts do, and do not mark it immutable. When deploying below a URL prefix, pass that prefix with the cache path as `basePath`, such as `/app/_vitecache/`; the entry does not infer Vite's base.
+
+The plugin adds the cache directory, `public/_vitecache/`, to `.gitignore`. A Node script outside Vite can use the same loaders. Its entries use `public/_vitecache/` below the working directory, or below `root` when passed.

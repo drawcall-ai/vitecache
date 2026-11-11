@@ -1,65 +1,112 @@
-import { declaration, isHashable, MissingDependencyError, savedDependencies } from './dependencies.js';
-import { key } from './key.js';
-import { createStorage, type Input, type Storage } from './storage.js';
-import type { CacheEntryOptions, Dependencies, Hashable, Resolved, SaveOptions } from './types.js';
-export { MissingDependencyError } from './dependencies.js';
-export type { CacheEntryOptions, Dependencies, Dependency, JsonValue, SavedDependencies, SavedDependency, SaveOptions } from './types.js';
+import { createHash } from 'node:crypto';
+import { mkdir, stat } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { join, resolve } from 'node:path';
+import writeFileAtomic from 'write-file-atomic';
+import { missing, read } from './disk.js';
+import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
+import { shared } from './shared.js';
+export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
 
-/** A named file or package and the hash of its current state, undefined when it has none. */
-interface State {
-  name: string;
-  dependency: Hashable;
-  hash: string | undefined;
+/** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
+interface Recorded {
+  dependency: Input;
+  state: string | undefined;
 }
 
 /**
- * A persistent binary computation result, read from and written to the cache directory on disk. Browsers only read
- * entries, so this is where results are computed and saved.
+ * File hashes by path, reused while size, mtime and ctime are unchanged. As git does, a hash taken within two seconds
+ * of the file's mtime is not kept, since a write in the same timestamp tick could follow it unseen.
  */
+const fileHashes = new Map<string, { stats: string; hash: Promise<string | undefined> }>();
+
+async function fileHash(path: string): Promise<string | undefined> {
+  const stats = await stat(path, { bigint: true }).catch((error: unknown) => {
+    if (missing(error)) return undefined;
+    throw error;
+  });
+  if (!stats) return undefined;
+  const signature = [stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs].join();
+  const known = fileHashes.get(path);
+  if (known?.stats === signature) return known.hash;
+  const hash = read(path).then((bytes) => bytes && createHash('sha256').update(bytes).digest('hex'));
+  if (BigInt(Date.now()) * 1_000_000n - stats.mtimeNs < 2_000_000_000n) fileHashes.delete(path);
+  else fileHashes.set(path, { stats: signature, hash });
+  return hash;
+}
+
+/** The installed version of a package as `root` resolves it, its own name included. */
+async function packageVersion(root: string, name: string): Promise<string | undefined> {
+  const own = join(root, 'package.json');
+  const directories = createRequire(own).resolve.paths(name) ?? [];
+  for (const file of [own, ...directories.map((directory) => join(directory, name, 'package.json'))]) {
+    const bytes = await read(file);
+    if (!bytes) continue;
+    const manifest: { name?: unknown; version?: unknown } = JSON.parse(new TextDecoder().decode(bytes));
+    if (file === own && manifest.name !== name) continue;
+    if (typeof manifest.version !== 'string') throw new TypeError(`${file} declares no version.`);
+    return manifest.version;
+  }
+  return undefined;
+}
+
+/** A cached result in the cache directory on disk, which Node computes and saves for every environment. */
 export class CacheEntry {
-  readonly #version: string;
-  readonly #dependencies: Dependencies;
-  readonly #storage: Storage;
-  /** What the last load() found the result's inputs to be, which save() records as what it was built from. */
-  #loaded: { key: string; inputs: State[] } | undefined;
+  readonly #key: string;
+  readonly #inputs: Input[];
+  readonly #root: string;
+  readonly #directory: string;
+  /** The declared inputs as the last load() found them, which save() records as what the result was built from. */
+  #loaded: Recorded[] | undefined;
 
   constructor(options: CacheEntryOptions) {
-    ({ version: this.#version, dependencies: this.#dependencies } = declaration(options));
-    this.#storage = createStorage(options);
+    this.#key = key(options);
+    const dependencies = Object.values(options.dependencies ?? {});
+    this.#inputs = dependencies.filter((dependency): dependency is Input => !('value' in dependency));
+    this.#root = resolve(options.root ?? shared.root ?? process.cwd());
+    const plugin = options.root === undefined ? shared.directory : undefined;
+    this.#directory = plugin ?? join(this.#root, 'public/_vitecache');
   }
 
-  #state(resolved: Dependencies<Resolved>): Promise<State[]> {
-    return Promise.all(Object.entries(resolved).flatMap(([name, dependency]) =>
-      isHashable(dependency) ? [this.#storage.hash(dependency).then((hash) => ({ name, dependency, hash }))] : []));
+  #record(inputs: readonly Input[]): Promise<Recorded[]> {
+    return Promise.all(
+      inputs.map(async (dependency) => ({
+        dependency,
+        state:
+          'path' in dependency
+            ? await fileHash(resolve(this.#root, dependency.path))
+            : await packageVersion(this.#root, dependency.package),
+      })),
+    );
   }
 
-  /**
-   * The saved bytes while every file and package they were built from is unchanged, otherwise undefined. A hit is a plain
-   * Uint8Array, not a Node Buffer, that owns its whole ArrayBuffer: its slice() copies, and its buffer can be transferred.
-   */
+  /** The saved bytes while every input they were built from is unchanged, otherwise undefined. */
   async load(): Promise<Uint8Array | undefined> {
-    const resolved = await this.#storage.resolve(this.#dependencies);
-    const inputs = await this.#state(resolved);
-    this.#loaded = { key: key(this.#version, resolved), inputs };
-    if (inputs.some((input) => input.hash === undefined)) return undefined;
-    return (await this.#storage.load(this.#loaded.key))?.bytes;
+    shared.used.set(this.#key, Date.now());
+    this.#loaded = await this.#record(this.#inputs);
+    const metadata = await read(join(this.#directory, `${this.#key}.json`));
+    if (!metadata) return undefined;
+    // Written by save() below; any other shape compares unequal. Metadata from before 0.4 has no inputs, and misses.
+    const { inputs }: { inputs?: Recorded[] } = JSON.parse(new TextDecoder().decode(metadata));
+    if (!inputs) return undefined;
+    const current = await this.#record(inputs.map((input) => input.dependency));
+    if (JSON.stringify(current) !== JSON.stringify(inputs)) return undefined;
+    return read(join(this.#directory, `${this.#key}.bin`));
   }
 
-  /**
-   * Saves the bytes computed after a load(), recording the declared files and packages as that load() found them: one
-   * that changed during the computation makes the next load() miss. One without a backing file, such as a server route,
-   * a virtual module or a package the app does not install, rejects with MissingDependencyError.
-   */
+  /** Saves the result computed after load(), built from the inputs as that load() found them, plus `dependencies`. */
   async save(value: Uint8Array, options: SaveOptions = {}): Promise<void> {
-    const bytes = new Uint8Array(value);
-    const loaded = this.#loaded;
-    if (!loaded) throw new Error('Call CacheEntry.load() before computing the result to save.');
-    const saved = await this.#storage.resolve(savedDependencies(options.dependencies ?? {}));
-    const states = [...loaded.inputs, ...await this.#state(saved)];
-    const inputs: Input[] = states.map(({ name, dependency, hash }) => {
-      if (hash === undefined) throw new MissingDependencyError(`Missing file or package dependency: ${name}`);
-      return { dependency, hash };
-    });
-    await this.#storage.save(loaded.key, bytes, inputs);
+    if (!this.#loaded) throw new Error('Call CacheEntry.load() before computing the result to save.');
+    const inputs = [...this.#loaded, ...(await this.#record(options.dependencies ?? []))];
+    const missing = inputs.find((input) => input.state === undefined);
+    if (missing) throw new Error(`vitecache input has no file or package: ${JSON.stringify(missing.dependency)}`);
+    shared.saves++;
+    // Atomic writes, so that a reader sees the old file or the new one.
+    await mkdir(this.#directory, { recursive: true });
+    await writeFileAtomic(
+      join(this.#directory, `${this.#key}.bin`),
+      Buffer.from(value.buffer, value.byteOffset, value.byteLength),
+    );
+    await writeFileAtomic(join(this.#directory, `${this.#key}.json`), JSON.stringify({ inputs }));
   }
 }

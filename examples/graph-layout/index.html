@@ -23,7 +23,7 @@
     <figure aria-label="Generated build pipeline diagram"></figure>
     <output role="status" aria-live="polite">Checking the cache…</output>
     <p><a href="">Reload page</a> and inspect the Network panel: the layout module and ELK are requested only on a cache miss.</p>
-    <p><code>pnpm precompute</code> generates the SVG from Node. The build does this automatically, so production visitors never need to download the layout engine.</p>
+    <p>The vitecache plugin finds the <code>CachedGraphLayoutLoader</code> load and lays the graph out in Node, during development and in the build, so visitors never download the layout engine.</p>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

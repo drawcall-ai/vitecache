@@ -4,35 +4,26 @@ import { promisify } from 'node:util';
 import { expect, test } from 'vitest';
 import { build } from 'vite';
 
-const execute = promisify(execFile);
-
-test('selects Node exports and bundles the browser entry without filesystem code', async () => {
-  const { stdout } = await execute(process.execPath, ['--input-type=module', '-e',
-    "import * as api from 'vitecache'; console.log(import.meta.resolve('vitecache')); console.log(Object.keys(api).join(','));",
+test('in the built package, Node imports the Node entry, and browser bundles contain no Node code', async () => {
+  const { stdout } = await promisify(execFile)(process.execPath, [
+    '--input-type=module',
+    '-e',
+    "import * as api from 'vitecache'; console.log(import.meta.resolve('vitecache'), Object.keys(api).join());",
   ]);
-  const [path, exports] = stdout.trim().split('\n');
-  expect(path).toMatch(/\/dist\/node\.js$/);
-  expect(exports).toBe('CacheEntry,MissingDependencyError');
-  const bundle = await build({
+  expect(stdout.trim()).toMatch(/\/dist\/node\.js CacheEntry$/);
+  const output = await build({
     configFile: false,
     logLevel: 'silent',
-    plugins: [{
-      name: 'cache-consumer',
-      resolveId(id) {
-        if (id === resolve('consumer')) return '\0consumer';
+    plugins: [
+      {
+        name: 'consumer',
+        resolveId: (id) => (id === resolve('consumer') ? '\0consumer' : undefined),
+        load: (id) => (id === '\0consumer' ? "export { CacheEntry } from 'vitecache';" : undefined),
       },
-      load(id) {
-        if (id === '\0consumer') return "export { CacheEntry } from 'vitecache';";
-      },
-    }],
+    ],
     build: { write: false, minify: false, lib: { entry: 'consumer', formats: ['es'] } },
   });
-  const output = Array.isArray(bundle) ? bundle[0] : bundle;
-  if (!output || 'close' in output) throw new Error('Expected browser bundle output');
-  const chunk = output.output.find((item) => item.type === 'chunk');
-  if (!chunk || chunk.type !== 'chunk') throw new Error('Missing browser chunk');
-  expect(chunk.code).toContain('CacheEntry');
-  expect(chunk.code).not.toContain('node:fs');
-  expect(chunk.code).not.toContain('node:crypto');
-  expect(chunk.code).not.toContain('process.cwd');
+  const code = JSON.stringify(output);
+  expect(code).toContain('CacheEntry');
+  expect(code).not.toMatch(/node:|process\.cwd/);
 });
