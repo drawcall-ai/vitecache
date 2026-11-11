@@ -35,6 +35,6 @@ import { vitecache } from "vitecache/vite"
 export default defineConfig({ plugins: [vitecache()] })
 ```
 
-The plugin finds these loads by scanning the project's source files, computes them in Node during development and builds, and deletes entries no load uses. Browsers read the saved bytes.
+The plugin finds these loads by scanning the project's source files and the `.glts` scripts in `publicDir`, computes them in Node during development and builds, and deletes entries no load uses. Browsers read the saved bytes.
 
 For usage patterns, see the [vitecache skill](skills/vitecache/SKILL.md), also shipped in this package.
