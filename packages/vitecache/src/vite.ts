@@ -6,6 +6,7 @@ import { glob } from 'tinyglobby';
 import { createServer, normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
 import { cacheName, missing, read } from './disk.js';
 import { discover, type Load } from './discover.js';
+import { current } from './inputs.js';
 
 /** Adds the cache directory to the project's .gitignore, since its entries are generated. */
 async function ignore(root: string, directory: string): Promise<void> {
@@ -42,8 +43,8 @@ const warmServerMarker = 'vitecache:warm';
 /**
  * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
  * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
- * load uses. In development it scans and warms at startup and again after every file change, and holds cache requests
- * until warming finishes. A build scans and warms once.
+ * load uses. In development it scans and warms at startup and again after every file change, and holds a request for an
+ * entry whose inputs changed, or that does not exist, until warming finishes. A build scans and warms once.
  */
 export function vitecache(): Plugin {
   /** The loads each scanned file holds. */
@@ -234,12 +235,15 @@ export function vitecache(): Plugin {
     configureServer(devServer) {
       server = Promise.resolve(devServer);
       const prefix = `${config.base}${cacheName}/`;
-      // Serves entries itself, after warming: Vite's public file serving learns of new files only through its watcher.
+      // Serves entries itself, since Vite's public file serving learns of new files only through its watcher: an entry
+      // whose inputs are unchanged at once, any other once warming has saved or pruned it.
       devServer.middlewares.use((request, response, next) => {
         if (!request.url?.startsWith(prefix)) return next();
         const name = new URL(request.url, 'http://vitecache').pathname.slice(prefix.length);
-        if (!/^[a-f0-9]{64}\.bin$/.test(name)) return next();
-        void idle()
+        const key = /^([a-f0-9]{64})\.bin$/.exec(name)?.[1];
+        if (!key) return next();
+        void current(config.root, directory, key)
+          .then((fresh) => (fresh ? undefined : idle()))
           .then(() => read(join(directory, name)))
           .then((bytes) => {
             if (!bytes) return next();

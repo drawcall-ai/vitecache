@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, expect, test, vi } from 'vitest';
 import { build, createLogger, createServer, type ViteDevServer } from 'vite';
 import { key } from '../src/entry.js';
+import { CacheEntry } from '../src/node.js';
 
 const servers: ViteDevServer[] = [];
 const roots: string[] = [];
@@ -188,6 +189,34 @@ test('the dev server warms every load at startup, holds requests for it, and war
   );
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
   expect(await readdir(cache)).not.toContain(`${name(1)}.bin`);
+});
+
+test('the dev server serves an entry whose inputs are unchanged while it warms', async () => {
+  const root = await project(
+    "import { CachedHeldLoader as Held } from './held.js';\nnew Echo().loadAsync(1);\nnew Held().loadAsync();",
+  );
+  const released = join(root, 'node_modules/released');
+  await writeFile(
+    join(root, 'src/held.js'),
+    `
+    import { existsSync } from 'node:fs';
+    export class CachedHeldLoader {
+      async loadAsync() {
+        while (!existsSync(${JSON.stringify(released)})) await new Promise((done) => setTimeout(done, 20));
+      }
+    }`,
+  );
+  const dependencies = { value: { value: 1 }, input: { path: 'input.txt' } };
+  const entry = new CacheEntry({ version: 'echo@1', dependencies, root });
+  await entry.load();
+  await entry.save(new TextEncoder().encode('1a'));
+  await writeFile(join(root, '.gitignore'), 'public/_vitecache/*\n');
+  const server = await createServer({ root, server: { port: 0 } });
+  servers.push(server);
+  await server.listen();
+  const url = `${server.resolvedUrls?.local[0]}_vitecache/${key({ version: 'echo@1', dependencies })}.bin`;
+  expect(await (await fetch(url)).text()).toBe('1a');
+  await writeFile(released, '');
 });
 
 test('a dev server whose global another plugin took over prunes nothing', async () => {
