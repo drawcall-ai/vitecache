@@ -51,8 +51,8 @@ export function vitecache(): Plugin {
   let config: ResolvedConfig;
   const loaded = new Set<string>();
   let directory: string;
-  /** Runs loaders: the dev server itself, or in a build a server started for that. */
-  let server: ViteDevServer | undefined;
+  /** Runs loaders: the dev server itself, or in a build a server started for that, once, by the first load. */
+  let server: Promise<ViteDevServer> | undefined;
   let queue = Promise.resolve();
   /** Whether a pass is queued but has not started, which the next change then need not queue again. */
   let queued = false;
@@ -77,19 +77,18 @@ export function vitecache(): Plugin {
   }
 
   async function run({ importer, source, name, args }: Load): Promise<void> {
-    if (!server) {
-      server = await createServer({
-        configFile: config.configFile ?? false,
-        root: config.root,
-        mode: config.mode,
-        logLevel: 'warn',
-        server: { middlewareMode: true, hmr: false, ws: false, watch: null },
-        plugins: [{ name: warmServerMarker }],
-      });
-    }
-    const resolved = await server.environments.ssr.pluginContainer.resolveId(source, importer);
+    server ??= createServer({
+      configFile: config.configFile ?? false,
+      root: config.root,
+      mode: config.mode,
+      logLevel: 'warn',
+      server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+      plugins: [{ name: warmServerMarker }],
+    });
+    const vite = await server;
+    const resolved = await vite.environments.ssr.pluginContainer.resolveId(source, importer);
     if (!resolved) throw new Error(`vitecache cannot resolve ${source} from ${importer}`);
-    const module: Record<string, unknown> = await server.ssrLoadModule(resolved.id);
+    const module: Record<string, unknown> = await vite.ssrLoadModule(resolved.id);
     const exported = module[name];
     if (typeof exported !== 'function') throw new Error(`${source} does not export a class ${name}`);
     const instance: unknown = Reflect.construct(exported, []);
@@ -115,27 +114,35 @@ export function vitecache(): Plugin {
   }
 
   /**
-   * Runs every load once, one at a time, then, unless a load failed, deletes the entries none of them loaded. A load
-   * still running after half a second is announced.
+   * Runs every load once, all at once, so that one waiting on the GPU or a worker leaves the others to run, then,
+   * unless a load failed, deletes the entries none of them loaded. A pass still running after half a second is
+   * announced, and so is its end.
    */
   async function pass(): Promise<void> {
     queued = false;
     failed = false;
     loaded.clear();
-    for (const load of [...files.values()].flat()) {
-      if (closing) return;
-      const file = normalizePath(relative(config.root, load.importer));
-      const where = `${load.name} ${colors.dim(`${file}:${load.position}`)}`;
-      const slow = setTimeout(() => log(`${colors.yellow('computing')} ${where}…`), 500);
-      try {
-        await run(load);
-      } catch (error) {
-        failed = true;
-        log(`${colors.red('failed')} ${where}\n${stack(error)}`, 'error');
-      } finally {
-        clearTimeout(slow);
-      }
-    }
+    if (closing) return;
+    const loads = [...files.values()].flat();
+    const started = performance.now();
+    let slow = false;
+    const timer = setTimeout(() => {
+      slow = true;
+      log(`${colors.yellow('computing')} ${loads.length} loads…`);
+    }, 500);
+    await Promise.all(
+      loads.map(async (load) => {
+        try {
+          await run(load);
+        } catch (error) {
+          failed = true;
+          const file = normalizePath(relative(config.root, load.importer));
+          log(`${colors.red('failed')} ${load.name} ${colors.dim(`${file}:${load.position}`)}\n${stack(error)}`, 'error');
+        }
+      }),
+    );
+    clearTimeout(timer);
+    if (slow) log(`warmed in ${((performance.now() - started) / 1000).toFixed(1)} s`);
     // Another plugin in this process may have replaced the global since, as a restarted dev server does.
     if (failed || closing || globalThis.vitecache?.loaded !== loaded) return;
     try {
@@ -220,12 +227,12 @@ export function vitecache(): Plugin {
         await warm();
         if (failed) throw new Error('vitecache: warming failed, see the errors above.');
       } finally {
-        await server?.close();
+        await (await server)?.close();
         server = undefined;
       }
     },
     configureServer(devServer) {
-      server = devServer;
+      server = Promise.resolve(devServer);
       const prefix = `${config.base}${cacheName}/`;
       // Serves entries itself, after warming: Vite's public file serving learns of new files only through its watcher.
       devServer.middlewares.use((request, response, next) => {
