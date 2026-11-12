@@ -1,54 +1,11 @@
-import { createHash } from 'node:crypto';
-import { mkdir, stat } from 'node:fs/promises';
-import { createRequire } from 'node:module';
+import { mkdir } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
-import { cacheName, missing, read } from './disk.js';
+import { cacheName, read } from './disk.js';
+import { current, record, type Recorded } from './inputs.js';
 import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
 export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
-
-/** An input and its state when it was read: a file's hash or a package's version, undefined when it has neither. */
-interface Recorded {
-  dependency: Input;
-  state: string | undefined;
-}
-
-/**
- * File hashes by path, reused while size, mtime and ctime are unchanged. As git does, a hash taken within two seconds
- * of the file's mtime is not kept, since a write in the same timestamp tick could follow it unseen.
- */
-const fileHashes = new Map<string, { stats: string; hash: Promise<string | undefined> }>();
-
-async function fileHash(path: string): Promise<string | undefined> {
-  const stats = await stat(path, { bigint: true }).catch((error: unknown) => {
-    if (missing(error)) return undefined;
-    throw error;
-  });
-  if (!stats) return undefined;
-  const signature = [stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs].join();
-  const known = fileHashes.get(path);
-  if (known?.stats === signature) return known.hash;
-  const hash = read(path).then((bytes) => bytes && createHash('sha256').update(bytes).digest('hex'));
-  if (BigInt(Date.now()) * 1_000_000n - stats.mtimeNs < 2_000_000_000n) fileHashes.delete(path);
-  else fileHashes.set(path, { stats: signature, hash });
-  return hash;
-}
-
-/** The installed version of a package as `root` resolves it, its own name included. */
-async function packageVersion(root: string, name: string): Promise<string | undefined> {
-  const own = join(root, 'package.json');
-  const directories = createRequire(own).resolve.paths(name) ?? [];
-  for (const file of [own, ...directories.map((directory) => join(directory, name, 'package.json'))]) {
-    const bytes = await read(file);
-    if (!bytes) continue;
-    const manifest: { name?: unknown; version?: unknown } = JSON.parse(new TextDecoder().decode(bytes));
-    if (file === own && manifest.name !== name) continue;
-    if (typeof manifest.version !== 'string') throw new TypeError(`${file} declares no version.`);
-    return manifest.version;
-  }
-  return undefined;
-}
 
 /**
  * The root and publicDir at `root`; without one, the plugin's once it has run in this process, else the working
@@ -97,29 +54,11 @@ export class CacheEntry {
     return { path: relative(this.#root, fileURLToPath(input.path)).split(sep).join('/') };
   }
 
-  #record(inputs: readonly Input[]): Promise<Recorded[]> {
-    return Promise.all(
-      inputs.map(async (dependency) => ({
-        dependency,
-        state:
-          'path' in dependency
-            ? await fileHash(resolve(this.#root, dependency.path))
-            : await packageVersion(this.#root, dependency.package),
-      })),
-    );
-  }
-
   /** The saved bytes while every input they were built from is unchanged, otherwise undefined. */
   async load(): Promise<Uint8Array | undefined> {
     globalThis.vitecache?.loaded.add(this.#key);
-    this.#loaded = await this.#record(this.#inputs);
-    const metadata = await read(join(this.#directory, `${this.#key}.json`));
-    if (!metadata) return undefined;
-    // Written by save() below; any other shape compares unequal. Metadata from before 0.4 has no inputs, and misses.
-    const { inputs }: { inputs?: Recorded[] } = JSON.parse(new TextDecoder().decode(metadata));
-    if (!inputs) return undefined;
-    const current = await this.#record(inputs.map((input) => input.dependency));
-    if (JSON.stringify(current) !== JSON.stringify(inputs)) return undefined;
+    this.#loaded = await record(this.#root, this.#inputs);
+    if (!(await current(this.#root, this.#directory, this.#key))) return undefined;
     return read(join(this.#directory, `${this.#key}.bin`));
   }
 
@@ -127,7 +66,7 @@ export class CacheEntry {
   async save(value: Uint8Array, options: SaveOptions = {}): Promise<void> {
     if (!this.#loaded) throw new Error('Call CacheEntry.load() before computing the result to save.');
     const saved = (options.dependencies ?? []).map((input) => this.#portable(input));
-    const inputs = [...this.#loaded, ...(await this.#record(saved))];
+    const inputs = [...this.#loaded, ...(await record(this.#root, saved))];
     const missing = inputs.find((input) => input.state === undefined);
     if (missing) throw new Error(`vitecache input has no file or package: ${JSON.stringify(missing.dependency)}`);
     // Atomic writes, so that a reader sees the old file or the new one.
