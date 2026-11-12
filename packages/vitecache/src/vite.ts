@@ -76,7 +76,8 @@ export function vitecache(): Plugin {
     }
   }
 
-  async function run({ importer, source, name, args }: Load): Promise<void> {
+  /** Imports a load's module and makes its loader, resolving to the load's run. */
+  async function prepare({ importer, source, name, args }: Load): Promise<() => Promise<unknown>> {
     server ??= createServer({
       configFile: config.configFile ?? false,
       root: config.root,
@@ -104,7 +105,8 @@ export function vitecache(): Plugin {
       const folder = path.slice(0, path.lastIndexOf('/') + 1).replace(/[%#?\\]/g, encodeURIComponent);
       instance.setPath(new URL(`/${folder}`, 'http://host').pathname);
     }
-    await instance.loadAsync(...args);
+    const { loadAsync } = instance;
+    return async () => Reflect.apply(loadAsync, instance, args);
   }
 
   /** Logs as Vite does with a timestamp, but tagged [vitecache], since Vite's own timestamp option tags lines [vite]. */
@@ -114,9 +116,9 @@ export function vitecache(): Plugin {
   }
 
   /**
-   * Runs every load once, all at once, so that one waiting on the GPU or a worker leaves the others to run, then,
-   * unless a load failed, deletes the entries none of them loaded. A pass still running after half a second is
-   * announced, and so is its end.
+   * Imports every load's module, then runs every load once, all at once, so that one waiting on the GPU or a worker
+   * leaves the others to run, then, unless a load failed, deletes the entries none of them loaded. A pass still running
+   * after half a second is announced, and so is its end.
    */
   async function pass(): Promise<void> {
     queued = false;
@@ -130,17 +132,9 @@ export function vitecache(): Plugin {
       slow = true;
       log(`${colors.yellow('computing')} ${loads.length} loads…`);
     }, 500);
-    await Promise.all(
-      loads.map(async (load) => {
-        try {
-          await run(load);
-        } catch (error) {
-          failed = true;
-          const file = normalizePath(relative(config.root, load.importer));
-          log(`${colors.red('failed')} ${load.name} ${colors.dim(`${file}:${load.position}`)}\n${stack(error)}`, 'error');
-        }
-      }),
-    );
+    // Running loads keep the event loop busy, and Vite's module runner fails an import it waits a minute for.
+    const runs = await Promise.all(loads.map((load) => attempt(load, () => prepare(load))));
+    await Promise.all(loads.map((load, i) => runs[i] && attempt(load, runs[i])));
     clearTimeout(timer);
     if (slow) log(`warmed in ${((performance.now() - started) / 1000).toFixed(1)} s`);
     // Another plugin in this process may have replaced the global since, as a restarted dev server does.
@@ -150,6 +144,18 @@ export function vitecache(): Plugin {
     } catch (error) {
       if (config.command === 'build') throw error;
       log(`${colors.red('cannot prune')} ${stack(error)}`, 'error');
+    }
+  }
+
+  /** `step`'s result, or undefined once its failure is logged, which fails the pass. */
+  async function attempt<T>(load: Load, step: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await step();
+    } catch (error) {
+      failed = true;
+      const file = normalizePath(relative(config.root, load.importer));
+      log(`${colors.red('failed')} ${load.name} ${colors.dim(`${file}:${load.position}`)}\n${stack(error)}`, 'error');
+      return undefined;
     }
   }
 
