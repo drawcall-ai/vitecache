@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, expect, test, vi } from 'vitest';
@@ -15,7 +15,8 @@ afterEach(async () => {
 });
 
 /**
- * A project whose page runs `main`, with a cached loader that saves its arguments and the contents of input.txt, and
+ * A project whose page runs `main`, with a cached loader that saves its arguments, the contents of input.txt and what
+ * an inline `transform` function returns, and
  * logs each run outside the watched files, and one that keys on the URL it loads, resolved against its path, and saves
  * that path, with the public file as an input.
  */
@@ -44,7 +45,8 @@ async function project(main: string): Promise<string> {
         const entry = new CacheEntry({ version: 'echo@1', dependencies });
         if (await entry.load()) return;
         const input = await readFile(new URL('../input.txt', import.meta.url), 'utf8');
-        await entry.save(new TextEncoder().encode(JSON.stringify(value) + input));
+        const transformed = typeof value?.transform === 'function' ? await value.transform() : '';
+        await entry.save(new TextEncoder().encode(JSON.stringify(value) + input + transformed));
       }
     }`,
   );
@@ -145,6 +147,53 @@ test('a build fails on a load in a public script whose loader has no setPath', a
   // A failed warming deletes nothing.
   expect(await readFile(stale, 'utf8')).toBe('stale');
   expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
+});
+
+test('inline functions warm from their source, key alike in the app, and invalidate with what they import', async () => {
+  const root = await project("import './parts.ts';");
+  await writeFile(join(root, 'src/part.js'), "export const part = 'p';");
+  await mkdir(join(root, 'node_modules/engine'));
+  await writeFile(join(root, 'node_modules/engine/package.json'), '{ "name": "engine", "version": "1.0.0" }');
+  await writeFile(join(root, 'node_modules/engine/index.js'), "export const engine = 'E';");
+  await writeFile(
+    join(root, 'src/parts.ts'),
+    `
+    import { CachedEchoLoader } from './loader.js';
+    await new CachedEchoLoader().loadAsync({
+      n: 1,
+      transform: async (): Promise<string> => (await import('./part.js')).part + (await import('engine')).engine,
+    });`,
+  );
+  const bins = async (directory: string) =>
+    (await readdir(join(root, directory)))
+      .filter((file) => file.endsWith('.bin'))
+      .map((file) => join(root, directory, file));
+  const contents = async () => Promise.all((await bins('dist/_vitecache')).map((file) => readFile(file, 'utf8')));
+  await build({ root });
+  expect(await contents()).toEqual(['{"n":1}apE']);
+  await writeFile(join(root, 'src/part.js'), "export const part = 'q';");
+  await build({ root });
+  expect(await contents()).toEqual(['{"n":1}aqE']);
+  // Browsers resolve nothing, so their tag's id must equal Node's despite the package import.
+  const server = await createServer({ root, server: { middlewareMode: true, hmr: false, ws: false } });
+  servers.push(server);
+  const id = async (environment: 'client' | 'ssr') =>
+    /"id":\s*"(\w+)"/.exec((await server.environments[environment].transformRequest('/src/parts.ts'))?.code ?? '')?.[1];
+  expect(await id('client')).toMatch(/^[0-9a-f]{64}$/);
+  expect(await id('client')).toBe(await id('ssr'));
+  // The app's own module, loaded in Node, hits what warming saved, rather than saving a new file.
+  const [entry = ''] = await bins('public/_vitecache');
+  const saved = (await stat(entry)).ino;
+  await server.ssrLoadModule('/src/parts.ts');
+  expect((await stat(entry)).ino).toBe(saved);
+});
+
+test('a build fails on an inline function in a public script', async () => {
+  const root = await project('');
+  await mkdir(join(root, 'public/tree'), { recursive: true });
+  const imported = "import { CachedLocatedLoader as Loader } from '../../src/located.js';";
+  await writeFile(join(root, 'public/tree/index.glts'), `${imported}\nnew Loader().loadAsync(() => 1);`);
+  await expect(build({ root })).rejects.toThrow(/Public scripts cannot pass inline functions/);
 });
 
 test.each([

@@ -82,6 +82,22 @@ export default defineConfig({ plugins: [vitecache()] })
 
 A load is a `loadAsync` call with literal JSON arguments on `new CachedMeshLoader()`, or on a variable initialized with it, as in `new CachedMeshLoader().loadAsync({ ratio: 0.5 })` or `const meshes = new CachedMeshLoader()` and later `meshes.loadAsync({ ratio: 0.5 })`. Any other use fails the build, and in development is logged: passing a loader or such a variable around, exporting or reassigning it, calling another of its methods such as `setPath`, which the plugin calls itself for loads in public scripts, subclassing the loader, or loading with a variable. To serve several fixed variants, write one literal load per variant.
 
+Arguments can also hold inline functions, as arrow or `function` expressions written in the load, which let the caller customize the computation:
+
+```ts
+await new CachedMeshLoader().loadAsync({
+  ratio: 0.5,
+  weld: async (mesh: Mesh) => {
+    const { weld } = await import("./weld.ts")
+    return weld(mesh, 0.01)
+  },
+})
+```
+
+Warming runs a copy of the function's source in Node, where its relative imports resolve as in the load's module. So it may use globals, what it declares and what it imports dynamically, but no name its module declares anywhere else, imports included. Write it as a property, `weld: (mesh) => …`, not as a method. The loader declares it in a `{ value }`, as it does JSON.
+
+The key counts a function by its source and its module's path. The modules it imports with a string literal are inputs: `{ path }` for project files and `{ package }` for installed packages. A change further down, in a file such a module imports, does not invalidate the entry, so import the module holding the computation directly. List `vitecache()` before plugins that transform source, since it reads functions as the file holds them. A function the plugin did not find inline in a load, such as one built at runtime, makes the key throw. Public scripts cannot pass inline functions, since browsers run them untransformed.
+
 The plugin finds loads by scanning the project's JavaScript and TypeScript files, as Tailwind scans for class names, and matches the loader's imported name through aliases and namespace imports. It also scans the `.glts` scripts and every JavaScript and TypeScript module in `publicDir`, so assets installed there are warmed too. It skips `node_modules` and the build output, so a library's loaders are warmed only where the app uses them. The plugin does not read `.vue` or `.svelte` files, and it warms a load in a file the app never imports, such as a test. Since variables are matched by name in the module, give a loader variable a name no other variable in that module uses. A library that ships cached loaders peer-depends on `vitecache`, so they and the plugin use the same vitecache.
 
 The plugin repeats each load in Node by importing the loader's module through Vite's SSR loading. That module and its top-level imports must load without browser globals, and whatever the loader does after loading, such as decoding, runs in Node too. A build loads the Vite config file again to run the loaders, so configure plugins they rely on there rather than inline in a programmatic build.

@@ -4,8 +4,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import writeFileAtomic from 'write-file-atomic';
 import { cacheName, read } from './disk.js';
 import { current, record, type Recorded } from './inputs.js';
-import { key, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
-export type { CacheEntryOptions, Dependency, Input, JsonValue, SaveOptions } from './entry.js';
+import { key, tags, type CacheEntryOptions, type Input, type SaveOptions } from './entry.js';
+export type { CacheEntryOptions, Dependency, Input, LoadFunction, SaveOptions, Value } from './entry.js';
 
 /**
  * The root and publicDir at `root`; without one, the plugin's once it has run in this process, else the working
@@ -41,8 +41,9 @@ export class CacheEntry {
 
   constructor(options: CacheEntryOptions) {
     this.#key = key(options);
-    const dependencies = Object.values(options.dependencies ?? {});
-    this.#inputs = dependencies.filter((dependency): dependency is Input => !('value' in dependency));
+    this.#inputs = Object.values(options.dependencies ?? {}).flatMap((dependency) =>
+      'value' in dependency ? tags(dependency.value).flatMap((tag) => tag.inputs) : [dependency],
+    );
     const { root, publicDir } = project(options.root);
     this.#root = resolve(root);
     this.#directory = resolve(publicDir, cacheName);
