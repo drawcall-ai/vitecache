@@ -18,3 +18,15 @@ test('keys are pinned, since a change to them orphans every saved entry', () => 
 test('values that JSON cannot represent throw rather than collide', () => {
   expect(() => key({ version: 'nan@1', dependencies: { n: { value: NaN } } })).toThrow();
 });
+
+/** A function as the plugin tags it. */
+const tagged = (fn: () => unknown, id: string, path: string) =>
+  Object.defineProperty(fn, Symbol.for('vitecache.function'), { value: { id, inputs: [{ path }] } });
+
+test('functions count as their identity, and untagged ones throw', () => {
+  const options = (weld: () => unknown) => ({ version: 'fn@1', dependencies: { settings: { value: { weld } } } });
+  // Browsers leave inputs empty, so they must not change the key.
+  expect(key(options(tagged(() => 1, 'a', 'weld.ts')))).toBe(key(options(tagged(() => 2, 'a', 'fuse.ts'))));
+  expect(key(options(tagged(() => 1, 'a', 'weld.ts')))).not.toBe(key(options(tagged(() => 1, 'b', 'weld.ts'))));
+  expect(() => key(options(() => 1))).toThrow(/inline/);
+});

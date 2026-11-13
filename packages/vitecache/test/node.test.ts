@@ -91,7 +91,7 @@ test('while the plugin warms, entries use its project and record their keys as l
   expect(await readdir(join(explicit, 'public/_vitecache'))).toHaveLength(2);
 });
 
-test('without the plugin, publicURL maps a root-absolute path below the working directory\'s public', () => {
+test("without the plugin, publicURL maps a root-absolute path below the working directory's public", () => {
   const file = pathToFileURL(join(process.cwd(), 'public/tree/a b.glts')).href;
   expect(publicURL('/tree/a%20b.glts')).toBe(file);
   expect(publicURL('/tree/a%20b.glts?v=1#top')).toBe(file);
@@ -113,4 +113,17 @@ test('save requires a load first and inputs that exist', async () => {
   await expect(
     compute({ root, version: 'missing@1', dependencies: { source: { path: 'missing.txt' } } }, [1]),
   ).rejects.toThrow(/no file/);
+});
+
+test('what an inline function imports is an input', async () => {
+  const root = await project();
+  await writeFile(join(root, 'weld.ts'), 'a');
+  const transform = Object.defineProperty(() => 1, Symbol.for('vitecache.function'), {
+    value: { id: 'f00d', inputs: [{ path: 'weld.ts' }] },
+  });
+  const options = { root, version: 'fn@1', dependencies: { transform: { value: transform } } };
+  await compute(options, [1]);
+  expect(await load(options)).toEqual(new Uint8Array([1]));
+  await writeFile(join(root, 'weld.ts'), 'b');
+  expect(await load(options)).toBeUndefined();
 });

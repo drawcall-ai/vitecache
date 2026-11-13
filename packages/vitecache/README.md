@@ -6,7 +6,7 @@ Cache expensive computation as bytes: the Vite plugin computes it once in Node, 
 pnpm add vitecache
 ```
 
-Wrap a computation in a class named `Cached…Loader` and load with literal arguments:
+Wrap a computation in a class named `Cached…Loader` and load with literal arguments, which can include inline functions:
 
 ```ts
 import { CacheEntry } from "vitecache"

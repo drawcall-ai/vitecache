@@ -1,6 +1,16 @@
-import JSON5 from 'json5';
 import { parseSync, Visitor, type ESTree } from 'vite';
-import type { JsonValue } from './entry.js';
+
+/** A source range in the importer. */
+export interface Range {
+  start: number;
+  end: number;
+}
+
+/** A function passed inline among a load's arguments, which warming repeats from its source. */
+export interface InlineFunction extends Range {
+  /** The specifiers it imports dynamically as string literals. */
+  imports: string[];
+}
 
 /** A `loadAsync(...args)` of a cached loader that discovery found, which warming repeats on a `new` loader in Node. */
 export interface Load {
@@ -9,7 +19,72 @@ export interface Load {
   position: string;
   source: string;
   name: string;
-  args: JsonValue[];
+  /** Each argument's source: JSON written as JavaScript literals, and inline functions. */
+  args: Range[];
+  functions: InlineFunction[];
+}
+
+/** An AST node, walked generically by its properties. */
+type Node = { type: string; start: number; end: number; [key: string]: unknown };
+
+const isNode = (value: unknown): value is Node =>
+  typeof value === 'object' && value !== null && typeof (value as { type?: unknown }).type === 'string';
+
+/** TypeScript nodes that hold a value; other TypeScript nodes are types, which name nothing at runtime. */
+const values = new Set([
+  'TSAsExpression',
+  'TSSatisfiesExpression',
+  'TSNonNullExpression',
+  'TSTypeAssertion',
+  'TSInstantiationExpression',
+  'TSParameterProperty',
+]);
+
+/** Visits every node below `node` outside types, with the parent and the property holding it. */
+function walk(node: Node, visit: (node: Node, parent: Node, key: string) => void): void {
+  for (const [key, child] of Object.entries(node)) {
+    for (const item of [child].flat()) {
+      if (!isNode(item) || (item.type.startsWith('TS') && !values.has(item.type))) continue;
+      visit(item, node, key);
+      walk(item, visit);
+    }
+  }
+}
+
+/** A root holding `node`, so that walking it visits `node` too. */
+const holding = (node: Node): Node => ({ type: 'Program', start: node.start, end: node.end, body: [node] });
+
+/** The names a binding pattern declares. */
+function bound(pattern: unknown, names: Set<string>): void {
+  if (!isNode(pattern)) return;
+  if (pattern.type === 'Identifier') names.add(pattern.name as string);
+  else if (pattern.type === 'ObjectPattern')
+    for (const property of pattern.properties as Node[])
+      bound(property.type === 'RestElement' ? property.argument : property.value, names);
+  else if (pattern.type === 'ArrayPattern') for (const element of pattern.elements as unknown[]) bound(element, names);
+  else if (pattern.type === 'AssignmentPattern') bound(pattern.left, names);
+  else if (pattern.type === 'RestElement') bound(pattern.argument, names);
+  else if (pattern.type === 'TSParameterProperty') bound(pattern.parameter, names);
+}
+
+/** Every name declared below `node`, in any scope. */
+function declared(node: Node): Set<string> {
+  const names = new Set<string>();
+  walk(node, (child) => {
+    if (child.type === 'VariableDeclarator') bound(child.id, names);
+    else if (child.type === 'CatchClause') bound(child.param, names);
+    else if (/^Import\w*Specifier$/.test(child.type)) bound(child.local, names);
+    else if (/Function|Class|^TS(Enum|Module)Declaration$|^TSImportEquals/.test(child.type)) bound(child.id, names);
+    if (/Function/.test(child.type)) for (const param of (child.params as unknown[]) ?? []) bound(param, names);
+  });
+  return names;
+}
+
+/** Whether an identifier at this place names a variable, rather than a property, label or meta property. */
+function referenced(parent: Node, key: string): boolean {
+  if (parent.computed !== true && key === 'key') return false;
+  if (parent.type === 'MemberExpression' && key === 'property' && parent.computed !== true) return false;
+  return key !== 'label' && parent.type !== 'MetaProperty';
 }
 
 /**
@@ -46,12 +121,55 @@ export function discover(code: string, importer: string): Load[] {
   }
   /** Nodes that name a loader or loader variable without using its value. */
   const allowed = new Set<ESTree.Node>();
-  // JSON5 is the literal subset of JavaScript: unquoted keys, single quotes, signed numbers.
-  const literal = (node: ESTree.Argument) => {
-    try {
-      return JSON5.parse<JsonValue>(code.slice(node.start, node.end));
-    } catch {
-      return fail('Cached loader loadAsync arguments must be literal JSON', node.start);
+  /** Names declared anywhere in the module, which an inline function must not use from outside itself. */
+  const context = declared(program as unknown as Node);
+  /** Checks that a function uses no variable of its module, so that warming can repeat it from its source alone. */
+  const inline = (node: Node): InlineFunction => {
+    const own = declared(holding(node));
+    const imports: string[] = [];
+    walk(holding(node), (child, parent, key) => {
+      if (child.type === 'ImportExpression' && isNode(child.source) && typeof child.source.value === 'string')
+        imports.push(child.source.value);
+      if (child.type !== 'Identifier' || !referenced(parent, key)) return;
+      const name = child.name as string;
+      if (context.has(name) && !own.has(name))
+        fail(`Inline functions in cached loader loads must not use ${name} from their module`, child.start);
+    });
+    return { start: node.start, end: node.end, imports };
+  };
+  /** JSON written as JavaScript literals, and inline functions, which it collects. */
+  const literal = (node: Node, functions: InlineFunction[]): void => {
+    const nested = (child: unknown) => literal(child as Node, functions);
+    const invalid = () =>
+      fail('Cached loader loadAsync arguments must be literal JSON or inline functions', node.start);
+    switch (node.type) {
+      case 'ArrowFunctionExpression':
+      case 'FunctionExpression':
+        return void functions.push(inline(node));
+      case 'ParenthesizedExpression':
+        return nested(node.expression);
+      case 'Literal':
+        if (node.value === null || ['string', 'number', 'boolean'].includes(typeof node.value)) return;
+        return invalid();
+      case 'UnaryExpression':
+        if (/^[-+]$/.test(node.operator as string) && isNode(node.argument) && typeof node.argument.value === 'number')
+          return;
+        return invalid();
+      case 'ArrayExpression':
+        for (const element of node.elements as unknown[]) {
+          if (!isNode(element) || element.type === 'SpreadElement') invalid();
+          nested(element);
+        }
+        return;
+      case 'ObjectExpression':
+        for (const property of node.properties as Node[]) {
+          const { type, kind, method, shorthand, computed } = property;
+          if (type !== 'Property' || kind !== 'init' || method || shorthand || computed) invalid();
+          nested(property.value);
+        }
+        return;
+      default:
+        return invalid();
     }
   };
   const target = (node: ESTree.Node) => {
@@ -111,7 +229,10 @@ export function discover(code: string, importer: string): Load[] {
             : undefined;
       if (!instance) return;
       allowed.add(object);
-      loads.push({ importer, position: at(node.start), ...instance, args: node.arguments.map(literal) });
+      const functions: InlineFunction[] = [];
+      for (const argument of node.arguments) literal(argument as unknown as Node, functions);
+      const args = node.arguments.map(({ start, end }) => ({ start, end }));
+      loads.push({ importer, position: at(node.start), ...instance, args, functions });
     },
     MemberExpression(node) {
       if (!node.computed) allowed.add(node.property);
