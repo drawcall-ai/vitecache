@@ -7,10 +7,10 @@ const load = (before: string, args: string) =>
     'main.ts',
   );
 
-test('inline functions may use globals, their own variables and types, and record what they import', () => {
+test('inline functions may use globals, their own variables, types and dynamic imports', () => {
   const weld = "async (mesh: Mesh) => { const { weld } = await import('./weld.ts'); return weld(mesh, Math.PI); }";
   const [found] = load('', `{ ratio: -0.5, weld: ${weld} }`);
-  expect(found?.functions.map((inline) => inline.imports)).toEqual([['./weld.ts']]);
+  expect(found?.functions).toHaveLength(1);
 });
 
 test.each([

@@ -60,8 +60,9 @@ async function project(main: string): Promise<string> {
         const resolved = new URL(url, new URL(this.path, 'http://host')).pathname;
         const entry = new CacheEntry({ version: 'located@1', dependencies: { url: { value: resolved } } });
         if (await entry.load()) return;
-        // Saving fails unless publicURL found the file below the plugin's publicDir.
-        await entry.save(new TextEncoder().encode(this.path), { dependencies: [{ path: publicURL(resolved) }] });
+        // Fails unless publicURL finds the file below the plugin's publicDir, which it records as an input.
+        await fetch(publicURL(resolved));
+        await entry.save(new TextEncoder().encode(this.path));
       }
     }`,
   );
@@ -149,9 +150,11 @@ test('a build fails on a load in a public script whose loader has no setPath', a
   expect(errors.join('\n').replace(/\x1b\[\d+m/g, '')).toMatch(/public\/tree\/index\.glts:3:7\n.*no setPath/);
 });
 
-test('inline functions warm from their source, key alike in the app, and invalidate with what they import', async () => {
+/** A project whose load passes a function importing part.js, which imports deep.js and the package engine. */
+async function functionProject() {
   const root = await project("import './parts.ts';");
-  await writeFile(join(root, 'src/part.js'), "export const part = 'p';");
+  await writeFile(join(root, 'src/part.js'), "export { part } from './deep.js'; export { engine } from 'engine';");
+  await writeFile(join(root, 'src/deep.js'), "export const part = 'p';");
   await mkdir(join(root, 'node_modules/engine'));
   await writeFile(join(root, 'node_modules/engine/package.json'), '{ "name": "engine", "version": "1.0.0" }');
   await writeFile(join(root, 'node_modules/engine/index.js'), "export const engine = 'E';");
@@ -161,31 +164,92 @@ test('inline functions warm from their source, key alike in the app, and invalid
     import { CachedEchoLoader } from './loader.js';
     await new CachedEchoLoader().loadAsync({
       n: 1,
-      transform: async (): Promise<string> => (await import('./part.js')).part + (await import('engine')).engine,
+      transform: async (): Promise<string> => {
+        const { part, engine } = await import('./part.js');
+        return part + engine;
+      },
     });`,
   );
-  const bins = async (directory: string) =>
-    (await readdir(join(root, directory)))
-      .filter((file) => file.endsWith('.bin'))
-      .map((file) => join(root, directory, file));
-  const contents = async () => Promise.all((await bins('dist/_vitecache')).map((file) => readFile(file, 'utf8')));
+  const cache = join(root, 'public/_vitecache');
+  const files = async (extension: string) =>
+    (await readdir(cache)).filter((file) => file.endsWith(extension)).map((file) => join(cache, file));
+  const saved = async () => Promise.all((await files('.bin')).map((file) => readFile(file, 'utf8')));
+  return { root, files, saved };
+}
+
+test('a load records what it ran as inputs, and a build computes it again once one changes', async () => {
+  const { root, files, saved } = await functionProject();
   await build({ root });
-  expect(await contents()).toEqual(['{"n":1}apE']);
-  await writeFile(join(root, 'src/part.js'), "export const part = 'q';");
+  expect(await saved()).toEqual(['{"n":1}apE']);
+  const [metadata = ''] = await files('.json');
+  const { inputs } = JSON.parse(await readFile(metadata, 'utf8'));
+  // The loader's module and what the function ran, not the importer of the load. The loader also runs vitecache's
+  // sources here, which an app installs as a package.
+  const recorded = inputs.map((input: { dependency: object }) => input.dependency);
+  expect(recorded).toEqual(
+    expect.arrayContaining([
+      { path: 'input.txt' },
+      { path: 'src/loader.js' },
+      { path: 'src/part.js' },
+      { path: 'src/deep.js' },
+      { path: 'node_modules/engine/package.json' },
+    ]),
+  );
+  expect(recorded).not.toContainEqual({ path: 'src/parts.ts' });
+  expect(recorded).not.toContainEqual({ path: 'node_modules/engine/index.js' });
+  await writeFile(join(root, 'src/deep.js'), "export const part = 'q';");
   await build({ root });
-  expect(await contents()).toEqual(['{"n":1}aqE']);
-  // Browsers resolve nothing, so their tag's id must equal Node's despite the package import.
+  expect(await saved()).toEqual(['{"n":1}aqE']);
+});
+
+test('a build fails when a module the load ran changes while the result is computed', async () => {
+  const { root } = await functionProject();
+  await writeFile(
+    join(root, 'src/parts.ts'),
+    `
+    import { CachedEchoLoader } from './loader.js';
+    await new CachedEchoLoader().loadAsync({
+      n: 1,
+      transform: async (): Promise<string> => {
+        const { part } = await import('./part.js');
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(new URL('./deep.js', import.meta.url), "export const part = 'q';");
+        return part;
+      },
+    });`,
+  );
+  const errors: string[] = [];
+  const customLogger = { ...createLogger('silent'), error: (message: string) => void errors.push(message) };
+  await expect(build({ root, customLogger })).rejects.toThrow(/warming failed/);
+  expect(errors.join('\n')).toMatch(/changed while the result was computed: \{"path":"src\/deep\.js"\}/);
+});
+
+test('inline functions key alike in the browser and in Node, where the app hits what warming saved', async () => {
+  const { root, files } = await functionProject();
+  await build({ root });
   const server = await createServer({ root, server: { middlewareMode: true, hmr: false, ws: false } });
   servers.push(server);
   const id = async (environment: 'client' | 'ssr') =>
-    /"id":\s*"(\w+)"/.exec((await server.environments[environment].transformRequest('/src/parts.ts'))?.code ?? '')?.[1];
+    /value: "(\w+)"/.exec((await server.environments[environment].transformRequest('/src/parts.ts'))?.code ?? '')?.[1];
   expect(await id('client')).toMatch(/^[0-9a-f]{64}$/);
   expect(await id('client')).toBe(await id('ssr'));
-  // The app's own module, loaded in Node, hits what warming saved, rather than saving a new file.
-  const [entry = ''] = await bins('public/_vitecache');
-  const saved = (await stat(entry)).ino;
+  const [entry = ''] = await files('.bin');
+  const inode = (await stat(entry)).ino;
   await server.ssrLoadModule('/src/parts.ts');
-  expect((await stat(entry)).ino).toBe(saved);
+  expect((await stat(entry)).ino).toBe(inode);
+});
+
+test('the dev server warms again when a module the load ran changes, and records what it newly runs', async () => {
+  const { root, saved } = await functionProject();
+  const server = await createServer({ root, server: { port: 0 } });
+  servers.push(server);
+  await server.listen();
+  await vi.waitFor(async () => expect(await saved()).toEqual(['{"n":1}apE']), { timeout: 10_000 });
+  await writeFile(join(root, 'src/deep.js'), "export { part } from './deeper.js';");
+  await writeFile(join(root, 'src/deeper.js'), "export const part = 'r';");
+  await vi.waitFor(async () => expect(await saved()).toEqual(['{"n":1}arE']), { timeout: 10_000 });
+  await writeFile(join(root, 'src/deeper.js'), "export const part = 's';");
+  await vi.waitFor(async () => expect(await saved()).toEqual(['{"n":1}asE']), { timeout: 10_000 });
 });
 
 test('a build fails on an inline function in a public script', async () => {

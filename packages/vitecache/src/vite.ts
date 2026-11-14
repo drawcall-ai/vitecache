@@ -1,15 +1,17 @@
 import { createHash } from 'node:crypto';
 import { appendFile, readdir, readFile, rm } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import MagicString from 'magic-string';
 import colors from 'picocolors';
 import picomatch from 'picomatch';
 import { glob } from 'tinyglobby';
 import { createServer, normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
-import { cacheName, missing, read } from './disk.js';
+import { createNodeImportMeta, ESModulesEvaluator, ModuleRunner, type EvaluatedModules } from 'vite/module-runner';
+import { cacheName, missing, read, type Warming } from './disk.js';
 import { discover, type Load } from './discover.js';
-import type { FunctionTag, Input } from './entry.js';
-import { current } from './inputs.js';
+import { current, record, type Recorded } from './inputs.js';
 
 /** Adds the cache directory to the project's .gitignore, since its entries are generated. */
 async function ignore(root: string, directory: string): Promise<void> {
@@ -26,39 +28,59 @@ function stack(error: unknown): string {
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** Resolves an import as a plugin context does. */
-type Resolve = (source: string, importer: string) => Promise<{ id: string } | null>;
+/**
+ * Wraps each of the loads' inline functions in a tag of its identity, the hash of its importer and source, which keys
+ * count it as.
+ */
+function tag(code: MagicString, loads: Load[], root: string): void {
+  const importer = (load: Load) => normalizePath(relative(root, load.importer));
+  for (const load of loads) {
+    for (const { start, end } of load.functions) {
+      const id = hash(`${importer(load)}\n${code.original.slice(start, end)}`);
+      code.prependRight(start, 'Object.defineProperty(');
+      code.appendLeft(end, `, Symbol.for("vitecache.function"), { value: ${JSON.stringify(id)} })`);
+    }
+  }
+}
 
-/** What an import resolved to: a package by its name, or a file below the project root. */
-function input(root: string, id: string): Input {
-  const path = normalizePath(id.split('?')[0] ?? id);
-  const installed = /\/node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(path.slice(path.lastIndexOf('/node_modules/')));
-  return installed?.[1] ? { package: installed[1] } : { path: normalizePath(relative(root, path)) };
+/** The input a module's file counts as: an installed package's module as its package.json, which covers its imports. */
+function moduleInput(file: string): string {
+  const installed = /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)?.[1];
+  return installed ? `${installed}/package.json` : file;
+}
+
+/** The file a module runner's fetch answered with, or undefined for a built-in or a module cached in the runner. */
+function fetchedFile(result: unknown): string | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  if ('file' in result && typeof result.file === 'string') return result.file;
+  if ('externalize' in result && typeof result.externalize === 'string' && result.externalize.startsWith('file:'))
+    return fileURLToPath(result.externalize);
+  return undefined;
 }
 
 /**
- * Wraps each of the loads' inline functions in a tag: its identity, the hash of its importer and source, which keys
- * count it as, and what it imports, which Node checks as inputs. Browsers check no inputs, so they resolve nothing,
- * as their resolution, such as to optimized dependencies, differs from Node's.
+ * The inputs of the modules reachable from `ids` in a module runner's graph of what it evaluated, which holds each
+ * import as it ran, dynamic ones included. An installed package's imports are left out, since its package.json covers
+ * them.
  */
-async function tag(code: MagicString, loads: Load[], root: string, resolve?: Resolve): Promise<void> {
-  for (const load of loads) {
-    for (const { start, end, imports } of load.functions) {
-      const inputs = resolve
-        ? await Promise.all(
-            imports.map(async (specifier) => {
-              const resolved = await resolve(specifier, load.importer);
-              if (!resolved) throw new Error(`vitecache cannot resolve ${specifier} from ${load.importer}`);
-              return input(root, resolved.id);
-            }),
-          )
-        : [];
-      const importer = normalizePath(relative(root, load.importer));
-      const value: FunctionTag = { id: hash(`${importer}\n${code.original.slice(start, end)}`), inputs };
-      code.prependRight(start, 'Object.defineProperty(');
-      code.appendLeft(end, `, Symbol.for("vitecache.function"), { value: ${JSON.stringify(value)} })`);
+function reachable(modules: EvaluatedModules, ids: Iterable<string>): string[] {
+  const inputs = new Set<string>();
+  const seen = new Set<string>();
+  const pending = [...ids];
+  for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
+    const module = modules.getModuleById(id);
+    if (!module || seen.has(id)) continue;
+    seen.add(id);
+    // Built-in modules have no file, and virtual ones no absolute one, but a virtual module's imports still count.
+    if (!isAbsolute(module.file)) {
+      pending.push(...module.imports);
+      continue;
     }
+    const input = moduleInput(module.file);
+    inputs.add(input);
+    if (input === module.file) pending.push(...module.imports);
   }
+  return [...inputs];
 }
 
 /** The query of the module that exports a load's arguments, whose value is the load's position in its importer. */
@@ -97,6 +119,16 @@ export function vitecache(): Plugin[] {
   let directory: string;
   /** Runs loaders: the dev server itself, or in a build a server started for that, once, by the first load. */
   let server: Promise<ViteDevServer> | undefined;
+  /**
+   * The plugin's own module runner on the server, whose graph records what each load ran. Not the environment's
+   * runner, whose graph a full reload after a change clears while a load runs. And it asks the environment directly,
+   * not over the hot channel, whose close removes the listener of its answers while closeBundle waits for the loads.
+   */
+  let runner: ModuleRunner | undefined;
+  /** The inputs of the modules the runner fetched, each as it was just after Vite answered the fetch. */
+  let fetched = new Map<string, Recorded>();
+  /** What the load being warmed uses, shared with CacheEntry through the global. */
+  let warming: AsyncLocalStorage<Warming>;
   let queue = Promise.resolve();
   /** Whether a pass is queued but has not started, which the next change then need not queue again. */
   let queued = false;
@@ -144,13 +176,13 @@ export function vitecache(): Plugin[] {
       return id.includes(query) ? id : undefined;
     },
     // Vite invalidates the module when its importer changes, since it shares its file.
-    async load(id) {
+    load(id) {
       const [importer = '', position] = id.split(query);
       const file = files.get(importer);
       const load = file?.loads.find((load) => load.position === position);
       if (!file || !load) return undefined;
       const code = new MagicString(file.code);
-      await tag(code, [load], config.root, (source, from) => this.resolve(source, from));
+      tag(code, [load], config.root);
       return `export default [${load.args.map(({ start, end }) => code.slice(start, end)).join(', ')}];`;
     },
     async transform(code, id) {
@@ -168,8 +200,7 @@ export function vitecache(): Plugin[] {
       if (code !== (await readFile(id, 'utf8')))
         throw new Error(`vitecache must come before plugins that transform ${id}`);
       const tagged = new MagicString(code);
-      const client = this.environment.config.consumer === 'client';
-      await tag(tagged, loads, config.root, client ? undefined : (source, from) => this.resolve(source, from));
+      tag(tagged, loads, config.root);
       return { code: tagged.toString(), map: tagged.generateMap({ hires: 'boundary', source: id }) };
     },
   };
@@ -183,10 +214,32 @@ export function vitecache(): Plugin[] {
       server: { middlewareMode: true, hmr: false, ws: false, watch: null },
       plugins: [{ name: warmServerMarker }, tagging],
     });
-    const vite = await server;
-    const resolved = await vite.environments.ssr.pluginContainer.resolveId(source, importer);
+    const environment = (await server).environments.ssr;
+    runner ??= new ModuleRunner(
+      {
+        transport: {
+          async invoke(payload) {
+            const answer = await environment.hot.handleInvoke(payload);
+            const file = 'result' in answer ? fetchedFile(answer.result) : undefined;
+            if (!file) return answer;
+            const input = moduleInput(file);
+            // Before the runner evaluates the module, which may change the file. Vite read it a little earlier, and a
+            // write in between goes unseen.
+            const [state] = await record(config.root, [{ path: pathToFileURL(input).href }]);
+            if (state) fetched.set(input, state);
+            return answer;
+          },
+        },
+        createImportMeta: createNodeImportMeta,
+        hmr: false,
+        sourcemapInterceptor: false,
+      },
+      new ESModulesEvaluator(),
+    );
+    const { evaluatedModules } = runner;
+    const resolved = await environment.pluginContainer.resolveId(source, importer);
     if (!resolved) throw new Error(`vitecache cannot resolve ${source} from ${importer}`);
-    const module: Record<string, unknown> = await vite.ssrLoadModule(resolved.id);
+    const module: Record<string, unknown> = await runner.import(resolved.id);
     const exported = module[name];
     if (typeof exported !== 'function') throw new Error(`${source} does not export a class ${name}`);
     const instance: unknown = Reflect.construct(exported, []);
@@ -202,9 +255,20 @@ export function vitecache(): Plugin[] {
       const folder = path.slice(0, path.lastIndexOf('/') + 1).replace(/[%#?\\]/g, encodeURIComponent);
       instance.setPath(new URL(`/${folder}`, 'http://host').pathname);
     }
-    const { default: args }: Record<string, unknown> = await vite.ssrLoadModule(`${importer}${query}${position}`);
+    const argumentsId = `${importer}${query}${position}`;
+    const { default: args }: Record<string, unknown> = await runner.import(argumentsId);
     if (!Array.isArray(args)) throw new Error(`vitecache cannot load the arguments of ${name}`);
-    await instance.loadAsync(...args);
+    // What the loader's module and the arguments' functions import, not the importer the arguments module shares.
+    const modules = () => {
+      const ids = [resolved.id, ...(evaluatedModules.getModuleById(argumentsId)?.imports ?? [])];
+      return reachable(evaluatedModules, ids).map((input) => {
+        const state = fetched.get(input);
+        if (!state) throw new Error(`vitecache did not see the runner fetch ${input}`);
+        return state;
+      });
+    };
+    const { loadAsync } = instance;
+    await warming.run({ files: [], modules }, () => loadAsync.apply(instance, args));
   }
 
   /** Logs as Vite does with a timestamp, but tagged [vitecache], since Vite's own timestamp option tags lines [vite]. */
@@ -306,7 +370,9 @@ export function vitecache(): Plugin[] {
           throw new Error('vitecache requires a Vite publicDir that does not contain the root');
         // Normalized, as are the files hotUpdate is given.
         directory = normalizePath(join(config.publicDir, cacheName));
-        globalThis.vitecache = { root: config.root, publicDir: config.publicDir, loaded };
+        // The same storage, so that a load an older plugin still warms records what it uses.
+        warming = globalThis.vitecache?.warming ?? new AsyncLocalStorage<Warming>();
+        globalThis.vitecache = { root: config.root, publicDir: config.publicDir, loaded, warming };
         const outputs = [config.build.outDir, config.publicDir].map((path) =>
           relative(config.root, resolve(config.root, path)),
         );
@@ -333,6 +399,9 @@ export function vitecache(): Plugin[] {
           await warm();
           if (failed) throw new Error('vitecache: warming failed, see the errors above.');
         } finally {
+          await runner?.close();
+          runner = undefined;
+          fetched = new Map();
           await (await server)?.close();
           server = undefined;
         }

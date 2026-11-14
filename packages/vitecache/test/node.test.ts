@@ -1,9 +1,12 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, expect, test, vi } from 'vitest';
 import { key, type CacheEntryOptions, type SaveOptions } from '../src/entry.js';
+import type { Warming } from '../src/disk.js';
+import { record } from '../src/inputs.js';
 import { CacheEntry, publicURL } from '../src/node.js';
 
 const roots: string[] = [];
@@ -45,16 +48,6 @@ test('a hit lasts while its file and package inputs are unchanged', async () => 
   expect(await load(options)).toBeUndefined();
 });
 
-test('an input that changes during the computation makes the next load miss', async () => {
-  const root = await project();
-  await writeFile(join(root, 'source.txt'), 'before');
-  const entry = new CacheEntry({ root, version: 'race@1', dependencies: { source: { path: 'source.txt' } } });
-  await entry.load();
-  await writeFile(join(root, 'source.txt'), 'after');
-  await entry.save(new Uint8Array([1]));
-  expect(await entry.load()).toBeUndefined();
-});
-
 test('inputs passed to save are checked without changing the key', async () => {
   const root = await project();
   await writeFile(join(root, 'texture.png'), 'a');
@@ -77,24 +70,85 @@ test('a file: URL input invalidates like a path, and is saved as one', async () 
   expect(await load(options)).toBeUndefined();
 });
 
+/** The global the plugin sets, for a project whose publicDir is `static`. */
+const plugin = (root: string) => ({
+  root,
+  publicDir: join(root, 'static'),
+  loaded: new Set<string>(),
+  warming: new AsyncLocalStorage<Warming>(),
+});
+
 test('while the plugin warms, entries use its project and record their keys as loaded', async () => {
   const root = await project();
-  const loaded = new Set<string>();
-  vi.stubGlobal('vitecache', { root, publicDir: join(root, 'static'), loaded });
+  const global = plugin(root);
+  vi.stubGlobal('vitecache', global);
   const options = { version: 'warm@1' };
   await compute(options, [1]);
   expect(await readdir(join(root, 'static/_vitecache'))).toHaveLength(2);
-  expect(loaded).toEqual(new Set([key(options)]));
-  expect(publicURL('/tree/model.glts')).toBe(pathToFileURL(join(root, 'static/tree/model.glts')).href);
+  expect(global.loaded).toEqual(new Set([key(options)]));
   const explicit = await project();
   await compute({ root: explicit, version: 'warm@1' }, [1]);
   expect(await readdir(join(explicit, 'public/_vitecache'))).toHaveLength(2);
 });
 
-test("without the plugin, publicURL maps a root-absolute path below the working directory's public", () => {
-  const file = pathToFileURL(join(process.cwd(), 'public/tree/a b.glts')).href;
-  expect(publicURL('/tree/a%20b.glts')).toBe(file);
-  expect(publicURL('/tree/a%20b.glts?v=1#top')).toBe(file);
+test('a load the plugin warms records the modules it ran and the public files publicURL gave it', async () => {
+  const root = await project();
+  const global = plugin(root);
+  vi.stubGlobal('vitecache', global);
+  await mkdir(join(root, 'static/tree'), { recursive: true });
+  await writeFile(join(root, 'static/tree/a b.bin'), new Uint8Array([7]));
+  await writeFile(join(root, 'weld.ts'), 'a');
+  const three = 'node_modules/.pnpm/three@1/node_modules/three/package.json';
+  await mkdir(join(root, dirname(three)), { recursive: true });
+  await writeFile(join(root, three), '{ "version": "1.0.0" }');
+  // As the plugin gives them, as file: URLs, which save() makes relative to the entry's root, here not the plugin's.
+  const files = [join(root, 'weld.ts'), join(root, three)].map((file) => ({ path: pathToFileURL(file).href }));
+  const recorded = await record(root, files);
+  const modules = () => recorded;
+  const app = join(root, 'app');
+  const options = { root: app, version: 'used@1' };
+  await global.warming.run({ files: [], modules }, async () => {
+    const entry = new CacheEntry(options);
+    await entry.load();
+    // A data: URL, since Node fetches no file: URLs, without the path's query and hash.
+    const response = await fetch(publicURL('/tree/a%20b.bin?v=1#top'));
+    await entry.save(new Uint8Array(await response.arrayBuffer()));
+  });
+  const [metadata = ''] = (await readdir(join(app, 'public/_vitecache'))).filter((file) => file.endsWith('.json'));
+  const { inputs } = JSON.parse(await readFile(join(app, 'public/_vitecache', metadata), 'utf8'));
+  expect(inputs.map((input: { dependency: object }) => input.dependency)).toEqual([
+    { path: '../static/tree/a b.bin' },
+    { path: '../weld.ts' },
+    { path: `../${three}` },
+  ]);
+});
+
+test.each([
+  ['a declared input', 'source.txt', () => {}],
+  ['a public file publicURL gave', 'static/model.bin', () => void publicURL('/model.bin')],
+])('%s that changes while the result is computed fails the save and deletes the entry', async (_, file, use) => {
+  const root = await project();
+  const global = plugin(root);
+  vi.stubGlobal('vitecache', global);
+  await mkdir(join(root, 'static'));
+  await writeFile(join(root, 'source.txt'), 'a');
+  await writeFile(join(root, 'static/model.bin'), 'a');
+  const options = { root, version: 'race@1', dependencies: { source: { path: 'source.txt' } } };
+  const computed = (during: () => Promise<void>) =>
+    global.warming.run({ files: [], modules: () => [] }, async () => {
+      const entry = new CacheEntry(options);
+      await entry.load();
+      use();
+      await during();
+      await entry.save(new Uint8Array([1]));
+    });
+  await computed(async () => {});
+  expect(await readdir(join(root, 'public/_vitecache'))).toHaveLength(2);
+  await expect(computed(() => writeFile(join(root, file), 'b'))).rejects.toThrow(/changed while the result/);
+  expect(await readdir(join(root, 'public/_vitecache'))).toEqual([]);
+});
+
+test('publicURL maps only root-absolute paths, and those only below publicDir', () => {
   for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts'])
     expect(publicURL(url)).toBe(url);
   for (const url of ['/../x', '/tree/%2e%2e/../x']) expect(() => publicURL(url)).toThrow(/outside publicDir/);
@@ -113,17 +167,4 @@ test('save requires a load first and inputs that exist', async () => {
   await expect(
     compute({ root, version: 'missing@1', dependencies: { source: { path: 'missing.txt' } } }, [1]),
   ).rejects.toThrow(/no file/);
-});
-
-test('what an inline function imports is an input', async () => {
-  const root = await project();
-  await writeFile(join(root, 'weld.ts'), 'a');
-  const transform = Object.defineProperty(() => 1, Symbol.for('vitecache.function'), {
-    value: { id: 'f00d', inputs: [{ path: 'weld.ts' }] },
-  });
-  const options = { root, version: 'fn@1', dependencies: { transform: { value: transform } } };
-  await compute(options, [1]);
-  expect(await load(options)).toEqual(new Uint8Array([1]));
-  await writeFile(join(root, 'weld.ts'), 'b');
-  expect(await load(options)).toBeUndefined();
 });

@@ -6,12 +6,6 @@ export interface Range {
   end: number;
 }
 
-/** A function passed inline among a load's arguments, which warming repeats from its source. */
-export interface InlineFunction extends Range {
-  /** The specifiers it imports dynamically as string literals. */
-  imports: string[];
-}
-
 /** A `loadAsync(...args)` of a cached loader that discovery found, which warming repeats on a `new` loader in Node. */
 export interface Load {
   importer: string;
@@ -21,7 +15,8 @@ export interface Load {
   name: string;
   /** Each argument's source: JSON written as JavaScript literals, and inline functions. */
   args: Range[];
-  functions: InlineFunction[];
+  /** The functions passed inline among the arguments, which warming repeats from their source. */
+  functions: Range[];
 }
 
 /** An AST node, walked generically by its properties. */
@@ -124,21 +119,18 @@ export function discover(code: string, importer: string): Load[] {
   /** Names declared anywhere in the module, which an inline function must not use from outside itself. */
   const context = declared(program as unknown as Node);
   /** Checks that a function uses no variable of its module, so that warming can repeat it from its source alone. */
-  const inline = (node: Node): InlineFunction => {
+  const inline = (node: Node): Range => {
     const own = declared(holding(node));
-    const imports: string[] = [];
     walk(holding(node), (child, parent, key) => {
-      if (child.type === 'ImportExpression' && isNode(child.source) && typeof child.source.value === 'string')
-        imports.push(child.source.value);
       if (child.type !== 'Identifier' || !referenced(parent, key)) return;
       const name = child.name as string;
       if (context.has(name) && !own.has(name))
         fail(`Inline functions in cached loader loads must not use ${name} from their module`, child.start);
     });
-    return { start: node.start, end: node.end, imports };
+    return { start: node.start, end: node.end };
   };
   /** JSON written as JavaScript literals, and inline functions, which it collects. */
-  const literal = (node: Node, functions: InlineFunction[]): void => {
+  const literal = (node: Node, functions: Range[]): void => {
     const nested = (child: unknown) => literal(child as Node, functions);
     const invalid = () =>
       fail('Cached loader loadAsync arguments must be literal JSON or inline functions', node.start);
@@ -229,7 +221,7 @@ export function discover(code: string, importer: string): Load[] {
             : undefined;
       if (!instance) return;
       allowed.add(object);
-      const functions: InlineFunction[] = [];
+      const functions: Range[] = [];
       for (const argument of node.arguments) literal(argument as unknown as Node, functions);
       const args = node.arguments.map(({ start, end }) => ({ start, end }));
       loads.push({ importer, position: at(node.start), ...instance, args, functions });
