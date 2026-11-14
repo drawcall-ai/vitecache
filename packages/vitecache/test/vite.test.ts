@@ -289,7 +289,7 @@ test('the dev server warms every load at startup, holds requests for it, and war
   const response = await fetch(url(1));
   expect(response.headers.get('content-type')).toBe('application/octet-stream');
   expect(await response.text()).toBe('1a');
-  expect(await readdir(cache)).not.toContain(stale);
+  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(stale));
   // The save's own files do not warm again.
   await new Promise((done) => setTimeout(done, 500));
   expect(await runs(root)).toBe(1);
@@ -301,7 +301,7 @@ test('the dev server warms every load at startup, holds requests for it, and war
     "import { CachedEchoLoader as Echo } from './loader.js';\nnew Echo().loadAsync(2);",
   );
   await vi.waitFor(async () => expect(await (await fetch(url(2))).text()).toBe('2b'));
-  expect(await readdir(cache)).not.toContain(`${name(1)}.bin`);
+  await vi.waitFor(async () => expect(await readdir(cache)).not.toContain(`${name(1)}.bin`));
 });
 
 test('the dev server serves an entry whose inputs are unchanged while it warms', async () => {
@@ -330,6 +330,58 @@ test('the dev server serves an entry whose inputs are unchanged while it warms',
   const url = `${server.resolvedUrls?.local[0]}_vitecache/${key({ version: 'echo@1', dependencies })}.bin`;
   expect(await (await fetch(url)).text()).toBe('1a');
   await writeFile(released, '');
+});
+
+test.each(['missing', 'stale'])('the dev server serves a %s entry as soon as it is saved', async (state) => {
+  const root = await project(
+    "import { CachedHeldLoader as Held } from './held.js';\nnew Echo().loadAsync(1);\nnew Held().loadAsync();",
+  );
+  const released = join(root, 'node_modules/released');
+  const compute = join(root, 'node_modules/compute');
+  const loader = join(root, 'src/loader.js');
+  await writeFile(loader, (await readFile(loader, 'utf8')).replace(
+    'const input = await readFile',
+    `while (!(await readFile(${JSON.stringify(compute)}).catch(() => undefined)))
+      await new Promise((done) => setTimeout(done, 20));
+    const input = await readFile`,
+  ));
+  await writeFile(join(root, 'src/held.js'), `
+    import { existsSync } from 'node:fs';
+    export class CachedHeldLoader {
+      async loadAsync() {
+        while (!existsSync(${JSON.stringify(released)})) await new Promise((done) => setTimeout(done, 20));
+      }
+    }`);
+  const dependencies = { value: { value: 1 }, input: { path: 'input.txt' } };
+  const name = key({ version: 'echo@1', dependencies });
+  if (state === 'stale') {
+    const entry = new CacheEntry({ version: 'echo@1', dependencies, root });
+    await entry.load();
+    await entry.save(new TextEncoder().encode('old'));
+    await writeFile(join(root, 'input.txt'), 'b');
+  }
+  await writeFile(join(root, '.gitignore'), 'public/_vitecache/*\n');
+  const server = await createServer({ root, server: { port: 0 } });
+  servers.push(server);
+  await server.listen();
+  const url = `${server.resolvedUrls?.local[0]}_vitecache/${name}.bin`;
+  let received: string | undefined;
+  const response = fetch(url).then((response) => response.text()).then((text) => { received = text; });
+  try {
+    await vi.waitFor(async () => expect(await runs(root)).toBe(1));
+    expect(received).toBeUndefined();
+    await writeFile(compute, 'go');
+    // The requested entry exists, but the unrelated loader is still held.
+    const expected = state === 'stale' ? '1b' : '1a';
+    await vi.waitFor(async () => expect(await readFile(join(root, 'public/_vitecache', `${name}.bin`), 'utf8')).toBe(expected));
+    await vi.waitFor(() => expect(received).toBe(expected));
+  } finally {
+    await writeFile(compute, 'go');
+    await writeFile(released, '');
+    await response;
+  }
+  // No load saves this key: after warming, normal not-found handling must still run.
+  expect((await fetch(`${server.resolvedUrls?.local[0]}_vitecache/${'0'.repeat(64)}.bin`, { headers: { Accept: 'application/octet-stream' } })).status).toBe(404);
 });
 
 test('a dev server whose global another plugin took over prunes nothing', async () => {

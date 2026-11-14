@@ -99,5 +99,6 @@ export class CacheEntry {
       Buffer.from(value.buffer, value.byteOffset, value.byteLength),
     );
     await writeFileAtomic(join(this.#directory, `${this.#key}.json`), JSON.stringify({ inputs }));
+    globalThis.vitecache?.saved?.(this.#directory, this.#key);
   }
 }

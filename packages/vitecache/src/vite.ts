@@ -109,7 +109,7 @@ const warmServerMarker = 'vitecache:warm';
  * Finds cached loader loads in the project's source files, and in publicDir's `.glts` scripts and every JavaScript and
  * TypeScript module there, and warms them in Node, so that browsers read what Node saved, then deletes the entries no
  * load uses. In development it scans and warms at startup and again after every file change, and holds a request for an
- * entry whose inputs changed, or that does not exist, until warming finishes. A build scans and warms once.
+ * entry whose inputs changed, or that does not exist, until it is saved or warming finishes. A build scans and warms once.
  */
 export function vitecache(): Plugin[] {
   /** Each scanned file with loads, and its loads. */
@@ -129,6 +129,7 @@ export function vitecache(): Plugin[] {
   let fetched = new Map<string, Recorded>();
   /** What the load being warmed uses, shared with CacheEntry through the global. */
   let warming: AsyncLocalStorage<Warming>;
+  const waiting = new Map<string, Set<() => void>>();
   let queue = Promise.resolve();
   /** Whether a pass is queued but has not started, which the next change then need not queue again. */
   let queued = false;
@@ -337,6 +338,27 @@ export function vitecache(): Plugin[] {
     } while (current !== queue);
   }
 
+  /** A saved entry can be served before unrelated loads finish; absent entries still wait for the pass. */
+  async function available(key: string): Promise<void> {
+    for (;;) {
+      // Subscribe before checking freshness, including after a save: its inputs may have changed again.
+      const listeners = waiting.get(key) ?? new Set<() => void>();
+      waiting.set(key, listeners);
+      let saved!: () => void;
+      const ready = new Promise<boolean>((done) => {
+        saved = () => done(true);
+      });
+      listeners.add(saved);
+      try {
+        if (await current(config.root, directory, key)) return;
+        if (!(await Promise.race([ready, idle().then(() => false)]))) return;
+      } finally {
+        listeners.delete(saved);
+        if (!listeners.size) waiting.delete(key);
+      }
+    }
+  }
+
   /** Deletes the entries whose keys are not in `loaded`. */
   async function prune(): Promise<void> {
     const names = await readdir(directory).catch((error: unknown) => {
@@ -372,7 +394,15 @@ export function vitecache(): Plugin[] {
         directory = normalizePath(join(config.publicDir, cacheName));
         // The same storage, so that a load an older plugin still warms records what it uses.
         warming = globalThis.vitecache?.warming ?? new AsyncLocalStorage<Warming>();
-        globalThis.vitecache = { root: config.root, publicDir: config.publicDir, loaded, warming };
+        globalThis.vitecache = {
+          root: config.root,
+          publicDir: config.publicDir,
+          loaded,
+          warming,
+          saved(path, key) {
+            if (normalizePath(path) === directory) for (const done of waiting.get(key) ?? []) done();
+          },
+        };
         const outputs = [config.build.outDir, config.publicDir].map((path) =>
           relative(config.root, resolve(config.root, path)),
         );
@@ -416,8 +446,7 @@ export function vitecache(): Plugin[] {
           const name = new URL(request.url, 'http://vitecache').pathname.slice(prefix.length);
           const key = /^([a-f0-9]{64})\.bin$/.exec(name)?.[1];
           if (!key) return next();
-          void current(config.root, directory, key)
-            .then((fresh) => (fresh ? undefined : idle()))
+          void available(key)
             .then(() => read(join(directory, name)))
             .then((bytes) => {
               if (!bytes) return next();
