@@ -19,7 +19,14 @@ declare global {
    * passes then prune nothing.
    */
   var vitecache:
-    | { root: string; publicDir: string; loaded: Set<string>; warming: AsyncLocalStorage<Warming> }
+    | {
+        root: string;
+        publicDir: string;
+        loaded: Set<string>;
+        warming: AsyncLocalStorage<Warming>;
+        /** Called only after both the bytes and their input metadata have been saved. */
+        saved?: (directory: string, key: string) => void;
+      }
     | undefined;
 }
 
