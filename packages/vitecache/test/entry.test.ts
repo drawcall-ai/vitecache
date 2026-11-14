@@ -20,13 +20,12 @@ test('values that JSON cannot represent throw rather than collide', () => {
 });
 
 /** A function as the plugin tags it. */
-const tagged = (fn: () => unknown, id: string, path: string) =>
-  Object.defineProperty(fn, Symbol.for('vitecache.function'), { value: { id, inputs: [{ path }] } });
+const tagged = (fn: () => unknown, id: string) =>
+  Object.defineProperty(fn, Symbol.for('vitecache.function'), { value: id });
 
 test('functions count as their identity, and untagged ones throw', () => {
   const options = (weld: () => unknown) => ({ version: 'fn@1', dependencies: { settings: { value: { weld } } } });
-  // Browsers leave inputs empty, so they must not change the key.
-  expect(key(options(tagged(() => 1, 'a', 'weld.ts')))).toBe(key(options(tagged(() => 2, 'a', 'fuse.ts'))));
-  expect(key(options(tagged(() => 1, 'a', 'weld.ts')))).not.toBe(key(options(tagged(() => 1, 'b', 'weld.ts'))));
+  expect(key(options(tagged(() => 1, 'a')))).toBe(key(options(tagged(() => 2, 'a'))));
+  expect(key(options(tagged(() => 1, 'a')))).not.toBe(key(options(tagged(() => 1, 'b'))));
   expect(() => key(options(() => 1))).toThrow(/inline/);
 });

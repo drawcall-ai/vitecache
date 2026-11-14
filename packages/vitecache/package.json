@@ -1,6 +1,6 @@
 {
   "name": "vitecache",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Persistent binary caching for expensive computation, warmed in Node by a Vite plugin and read in browsers and Node.",
   "type": "module",
   "license": "MIT",

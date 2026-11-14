@@ -7,7 +7,7 @@ export class CachedGraphLayoutLoader {
   async loadAsync(graph: Graph): Promise<string> {
     const entry = new CacheEntry({
       version: 'graph-layout@1',
-      dependencies: { graph: { value: graph }, algorithm: { path: 'src/layout.ts' }, elk: { package: 'elkjs' } },
+      dependencies: { graph: { value: graph } },
     });
     let bytes = await entry.load();
     if (bytes === undefined) {

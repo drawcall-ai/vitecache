@@ -8,10 +8,7 @@ import { configure } from 'safe-stable-stringify';
  */
 export type Input = { readonly path: string } | { readonly package: string };
 
-/**
- * A function a load passes inline. The vitecache plugin tags it with its identity, which keys count it as, and with
- * what it imports dynamically, which Node checks as inputs.
- */
+/** A function a load passes inline, which the vitecache plugin tags with its identity, which keys count it as. */
 export type LoadFunction = (...args: never[]) => unknown;
 
 /** JSON, which can hold functions that loads pass inline. */
@@ -46,28 +43,15 @@ export interface SaveOptions {
   dependencies?: readonly Input[];
 }
 
-/** What the vitecache plugin tags an inline function with, under the global symbol `vitecache.function`. */
-export interface FunctionTag {
-  /** The SHA-256 of its importer's path and its source. */
-  id: string;
-  /** What it imports dynamically, which browsers leave empty since they check no inputs. */
-  inputs: Input[];
-}
-
-const tagged = Symbol.for('vitecache.function');
-
-/** The plugin's tag of a function, which only inline load arguments the plugin found have. */
-function tag(value: LoadFunction): FunctionTag {
-  const found: unknown = Reflect.get(value, tagged);
-  if (!found) throw new TypeError('vitecache values can hold only functions passed inline to a load the plugin finds.');
-  return found as FunctionTag;
-}
-
-/** The tags of the functions a value holds. */
-export function tags(value: Value): FunctionTag[] {
-  if (typeof value === 'function') return [tag(value)];
-  if (typeof value !== 'object' || value === null) return [];
-  return Object.values(value).flatMap(tags);
+/**
+ * A function's identity, the SHA-256 of its importer's path and its source, which the plugin tags inline load arguments
+ * with under the global symbol `vitecache.function`.
+ */
+function identity(value: LoadFunction): string {
+  const id: unknown = Reflect.get(value, Symbol.for('vitecache.function'));
+  if (typeof id !== 'string')
+    throw new TypeError('vitecache values can hold only functions passed inline to a load the plugin finds.');
+  return id;
 }
 
 /** JSON with sorted object keys, so that declaration order does not change the key; anything else throws. */
@@ -84,7 +68,7 @@ export function key(options: CacheEntryOptions): string {
       );
   const declaration = stringify(
     { version: options.version, dependencies: options.dependencies ?? {} },
-    (_, value: unknown) => (typeof value === 'function' ? { function: tag(value as LoadFunction).id } : value),
+    (_, value: unknown) => (typeof value === 'function' ? { function: identity(value as LoadFunction) } : value),
   );
   if (declaration === undefined) throw new TypeError('vitecache cannot key this declaration.');
   return bytesToHex(sha256(new TextEncoder().encode(declaration)));
