@@ -202,6 +202,28 @@ test('a load records what it ran as inputs, and a build computes it again once o
   expect(await saved()).toEqual(['{"n":1}aqE']);
 });
 
+test('a build fails when a module the load ran changes while the result is computed', async () => {
+  const { root } = await functionProject();
+  await writeFile(
+    join(root, 'src/parts.ts'),
+    `
+    import { CachedEchoLoader } from './loader.js';
+    await new CachedEchoLoader().loadAsync({
+      n: 1,
+      transform: async (): Promise<string> => {
+        const { part } = await import('./part.js');
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(new URL('./deep.js', import.meta.url), "export const part = 'q';");
+        return part;
+      },
+    });`,
+  );
+  const errors: string[] = [];
+  const customLogger = { ...createLogger('silent'), error: (message: string) => void errors.push(message) };
+  await expect(build({ root, customLogger })).rejects.toThrow(/warming failed/);
+  expect(errors.join('\n')).toMatch(/changed while the result was computed: \{"path":"src\/deep\.js"\}/);
+});
+
 test('inline functions key alike in the browser and in Node, where the app hits what warming saved', async () => {
   const { root, files } = await functionProject();
   await build({ root });

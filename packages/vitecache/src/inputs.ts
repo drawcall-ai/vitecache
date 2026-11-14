@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { missing, read } from './disk.js';
 import type { Input } from './entry.js';
 
@@ -9,6 +10,11 @@ import type { Input } from './entry.js';
 export interface Recorded {
   dependency: Input;
   state: string | undefined;
+}
+
+/** The state of a file with these bytes. */
+export function hashOf(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 /**
@@ -26,7 +32,7 @@ async function fileHash(path: string): Promise<string | undefined> {
   const signature = [stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs].join();
   const known = fileHashes.get(path);
   if (known?.stats === signature) return known.hash;
-  const hash = read(path).then((bytes) => bytes && createHash('sha256').update(bytes).digest('hex'));
+  const hash = read(path).then((bytes) => bytes && hashOf(bytes));
   if (BigInt(Date.now()) * 1_000_000n - stats.mtimeNs < 2_000_000_000n) fileHashes.delete(path);
   else fileHashes.set(path, { stats: signature, hash });
   return hash;
@@ -47,14 +53,16 @@ async function packageVersion(root: string, name: string): Promise<string | unde
   return undefined;
 }
 
-/** The current state of each input, read below `root`. */
+/** The current state of each input, a path read below `root`. */
 export function record(root: string, inputs: readonly Input[]): Promise<Recorded[]> {
   return Promise.all(
     inputs.map(async (dependency) => ({
       dependency,
       state:
         'path' in dependency
-          ? await fileHash(resolve(root, dependency.path))
+          ? await fileHash(
+              dependency.path.startsWith('file:') ? fileURLToPath(dependency.path) : resolve(root, dependency.path),
+            )
           : await packageVersion(root, dependency.package),
     })),
   );

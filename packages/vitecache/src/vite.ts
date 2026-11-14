@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, readdir, readFile, rm } from 'node:fs/promises';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import MagicString from 'magic-string';
 import colors from 'picocolors';
 import picomatch from 'picomatch';
@@ -10,7 +11,7 @@ import { createServer, normalizePath, type Plugin, type ResolvedConfig, type Vit
 import { createNodeImportMeta, ESModulesEvaluator, ModuleRunner, type EvaluatedModules } from 'vite/module-runner';
 import { cacheName, missing, read, type Warming } from './disk.js';
 import { discover, type Load } from './discover.js';
-import { current } from './inputs.js';
+import { current, record, type Recorded } from './inputs.js';
 
 /** Adds the cache directory to the project's .gitignore, since its entries are generated. */
 async function ignore(root: string, directory: string): Promise<void> {
@@ -42,13 +43,28 @@ function tag(code: MagicString, loads: Load[], root: string): void {
   }
 }
 
+/** The input a module's file counts as: an installed package's module as its package.json, which covers its imports. */
+function moduleInput(file: string): string {
+  const installed = /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)?.[1];
+  return installed ? `${installed}/package.json` : file;
+}
+
+/** The file a module runner's fetch answered with, or undefined for a built-in or a module cached in the runner. */
+function fetchedFile(result: unknown): string | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  if ('file' in result && typeof result.file === 'string') return result.file;
+  if ('externalize' in result && typeof result.externalize === 'string' && result.externalize.startsWith('file:'))
+    return fileURLToPath(result.externalize);
+  return undefined;
+}
+
 /**
- * The files of the modules reachable from `ids` in a module runner's graph of what it evaluated, which holds each
- * import as it ran, dynamic ones included. A package's module gives the package's package.json instead, whose version
- * covers its own imports.
+ * The inputs of the modules reachable from `ids` in a module runner's graph of what it evaluated, which holds each
+ * import as it ran, dynamic ones included. An installed package's imports are left out, since its package.json covers
+ * them.
  */
 function reachable(modules: EvaluatedModules, ids: Iterable<string>): string[] {
-  const files = new Set<string>();
+  const inputs = new Set<string>();
   const seen = new Set<string>();
   const pending = [...ids];
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
@@ -56,16 +72,15 @@ function reachable(modules: EvaluatedModules, ids: Iterable<string>): string[] {
     if (!module || seen.has(id)) continue;
     seen.add(id);
     // Built-in modules have no file, and virtual ones no absolute one, but a virtual module's imports still count.
-    const file = isAbsolute(module.file) ? module.file : undefined;
-    const installed = file && /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)?.[1];
-    if (installed) {
-      files.add(`${installed}/package.json`);
+    if (!isAbsolute(module.file)) {
+      pending.push(...module.imports);
       continue;
     }
-    if (file) files.add(file);
-    pending.push(...module.imports);
+    const input = moduleInput(module.file);
+    inputs.add(input);
+    if (input === module.file) pending.push(...module.imports);
   }
-  return [...files];
+  return [...inputs];
 }
 
 /** The query of the module that exports a load's arguments, whose value is the load's position in its importer. */
@@ -110,6 +125,8 @@ export function vitecache(): Plugin[] {
    * not over the hot channel, whose close removes the listener of its answers while closeBundle waits for the loads.
    */
   let runner: ModuleRunner | undefined;
+  /** The inputs of the modules the runner fetched, each as it was just after Vite answered the fetch. */
+  let fetched = new Map<string, Recorded>();
   /** What the load being warmed uses, shared with CacheEntry through the global. */
   let warming: AsyncLocalStorage<Warming>;
   let queue = Promise.resolve();
@@ -200,7 +217,19 @@ export function vitecache(): Plugin[] {
     const environment = (await server).environments.ssr;
     runner ??= new ModuleRunner(
       {
-        transport: { invoke: (payload) => environment.hot.handleInvoke(payload) },
+        transport: {
+          async invoke(payload) {
+            const answer = await environment.hot.handleInvoke(payload);
+            const file = 'result' in answer ? fetchedFile(answer.result) : undefined;
+            if (!file) return answer;
+            const input = moduleInput(file);
+            // Before the runner evaluates the module, which may change the file. Vite read it a little earlier, and a
+            // write in between goes unseen.
+            const [state] = await record(config.root, [{ path: pathToFileURL(input).href }]);
+            if (state) fetched.set(input, state);
+            return answer;
+          },
+        },
         createImportMeta: createNodeImportMeta,
         hmr: false,
         sourcemapInterceptor: false,
@@ -230,10 +259,16 @@ export function vitecache(): Plugin[] {
     const { default: args }: Record<string, unknown> = await runner.import(argumentsId);
     if (!Array.isArray(args)) throw new Error(`vitecache cannot load the arguments of ${name}`);
     // What the loader's module and the arguments' functions import, not the importer the arguments module shares.
-    const modules = () =>
-      reachable(evaluatedModules, [resolved.id, ...(evaluatedModules.getModuleById(argumentsId)?.imports ?? [])]);
+    const modules = () => {
+      const ids = [resolved.id, ...(evaluatedModules.getModuleById(argumentsId)?.imports ?? [])];
+      return reachable(evaluatedModules, ids).map((input) => {
+        const state = fetched.get(input);
+        if (!state) throw new Error(`vitecache did not see the runner fetch ${input}`);
+        return state;
+      });
+    };
     const { loadAsync } = instance;
-    await warming.run({ files: new Set(), modules }, () => loadAsync.apply(instance, args));
+    await warming.run({ files: [], modules }, () => loadAsync.apply(instance, args));
   }
 
   /** Logs as Vite does with a timestamp, but tagged [vitecache], since Vite's own timestamp option tags lines [vite]. */
@@ -366,6 +401,7 @@ export function vitecache(): Plugin[] {
         } finally {
           await runner?.close();
           runner = undefined;
+          fetched = new Map();
           await (await server)?.close();
           server = undefined;
         }

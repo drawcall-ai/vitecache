@@ -1,12 +1,13 @@
 import type { AsyncLocalStorage } from 'node:async_hooks';
 import { readFile } from 'node:fs/promises';
+import type { Recorded } from './inputs.js';
 
-/** What a load uses while the plugin warms it, which save() records as the result's inputs. */
+/** What a load uses while the plugin warms it, each input as it was when the load got it. */
 export interface Warming {
   /** The public files publicURL gave it. */
-  files: Set<string>;
-  /** The files of the modules it has run, an installed package's as its package.json. */
-  modules: () => string[];
+  files: Recorded[];
+  /** The modules it has run, an installed package's as its package.json, as the module runner fetched them. */
+  modules: () => Recorded[];
 }
 
 declare global {
