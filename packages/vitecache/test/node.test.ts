@@ -7,7 +7,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { key, type CacheEntryOptions, type SaveOptions } from '../src/entry.js';
 import type { Warming } from '../src/disk.js';
 import { record } from '../src/inputs.js';
-import { CacheEntry, publicURL } from '../src/node.js';
+import { CacheEntry, publicFile, publicURL } from '../src/node.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -148,10 +148,28 @@ test.each([
   expect(await readdir(join(root, 'public/_vitecache'))).toEqual([]);
 });
 
-test('publicURL maps only root-absolute paths, and those only below publicDir', () => {
-  for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts'])
+test('publicURL and publicFile map only root-absolute paths, and those only below publicDir', async () => {
+  for (const url of ['tree/model.glts', './model.glts', '//cdn.test/model.glts', 'https://cdn.test/model.glts']) {
     expect(publicURL(url)).toBe(url);
+    expect(publicFile(url)).toBe(url);
+  }
   for (const url of ['/../x', '/tree/%2e%2e/../x']) expect(() => publicURL(url)).toThrow(/outside publicDir/);
+  const root = await project();
+  vi.stubGlobal('vitecache', plugin(root));
+  expect(publicFile('/tree/a%20b.bin?v=1#top')).toBe(pathToFileURL(join(root, 'static/tree/a b.bin')).href);
+});
+
+test('an entry saved without the plugin, which records only the declared inputs, is computed again when it warms', async () => {
+  const root = await project();
+  const options = { root, version: 'unwarmed@1' };
+  await compute(options, [1]);
+  expect(await load(options)).toEqual(new Uint8Array([1]));
+  const global = plugin(root);
+  vi.stubGlobal('vitecache', global);
+  const warm = (run: () => Promise<unknown>) => global.warming.run({ files: [], modules: () => [] }, run);
+  expect(await warm(() => load(options))).toBeUndefined();
+  await warm(() => compute(options, [2]));
+  expect(await warm(() => load(options))).toEqual(new Uint8Array([2]));
 });
 
 test('a file: URL among the declared dependencies is refused, since it belongs on save()', () => {

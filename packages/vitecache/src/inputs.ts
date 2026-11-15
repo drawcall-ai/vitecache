@@ -68,13 +68,17 @@ export function record(root: string, inputs: readonly Input[]): Promise<Recorded
   );
 }
 
-/** Whether the entry `key` in `directory` was saved from inputs that are all unchanged below `root`. */
-export async function current(root: string, directory: string, key: string): Promise<boolean> {
+/**
+ * Whether the entry `key` in `directory` was saved from inputs that are all unchanged below `root`, and, given
+ * `warmed`, while the plugin warmed its load.
+ */
+export async function current(root: string, directory: string, key: string, warmed: boolean): Promise<boolean> {
   const metadata = await read(join(directory, `${key}.json`));
   if (!metadata) return false;
   // Written by save() below; any other shape compares unequal. Metadata from before 0.4 has no inputs, and misses.
-  const { inputs }: { inputs?: Recorded[] } = JSON.parse(new TextDecoder().decode(metadata));
-  if (!inputs) return false;
+  const saved: { inputs?: Recorded[]; warmed?: boolean } = JSON.parse(new TextDecoder().decode(metadata));
+  const { inputs } = saved;
+  if (!inputs || (warmed && saved.warmed !== true)) return false;
   const now = await record(
     root,
     inputs.map((input) => input.dependency),

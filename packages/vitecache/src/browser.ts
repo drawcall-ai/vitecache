@@ -3,6 +3,11 @@ export type { CacheEntryOptions, Dependency, Input, LoadFunction, SaveOptions, V
 
 const warned = new Set<string>();
 
+/** A public file's path as an input: in browsers, its URL itself, since they save no entries. */
+export function publicFile(url: string): string {
+  return url;
+}
+
 /** The URL to read a public file at: in browsers, its URL itself, since they load public files over HTTP. */
 export function publicURL(url: string): string {
   return url;

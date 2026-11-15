@@ -10,7 +10,7 @@ test('in the built package, Node imports the Node entry, and browser bundles con
     '-e',
     "import * as api from 'vitecache'; console.log(import.meta.resolve('vitecache'), Object.keys(api).join());",
   ]);
-  expect(stdout.trim()).toMatch(/\/dist\/node\.js CacheEntry,publicURL$/);
+  expect(stdout.trim()).toMatch(/\/dist\/node\.js CacheEntry,publicFile,publicURL$/);
   const output = await build({
     configFile: false,
     logLevel: 'silent',
