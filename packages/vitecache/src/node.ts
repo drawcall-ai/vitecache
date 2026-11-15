@@ -19,19 +19,28 @@ function project(root?: string): { root: string; publicDir: string } {
 }
 
 /**
- * The URL to fetch a public file at: for a root-absolute path such as `/tree/model.glb`, a `data:` URL of that file
- * below publicDir, without the path's query and hash, since Node fetches no `file:` URLs. It holds the whole file, so a
- * file must fit in memory as a string. The file becomes an input of the load the plugin is warming. Any other URL is
- * returned unchanged. The publicDir is the plugin's once it has run in this process, else `public` below the working
- * directory.
+ * The `file:` URL of the public file at a root-absolute path such as `/tree/model.glb`, below publicDir, without the
+ * path's query and hash, as save() takes it as an input. Any other URL is returned unchanged. The publicDir is the
+ * plugin's once it has run in this process, else `public` below the working directory.
  */
-export function publicURL(url: string): string {
+export function publicFile(url: string): string {
   if (!url.startsWith('/') || url.startsWith('//')) return url;
   const base = pathToFileURL(`${project().publicDir}/`);
   const file = new URL(`.${url.replace(/[?#].*/s, '')}`, base);
-  if (!file.href.startsWith(base.href)) throw new Error(`vitecache publicURL: ${url} lies outside publicDir`);
-  const bytes = readFileSync(file);
-  globalThis.vitecache?.warming.getStore()?.files.push({ dependency: { path: file.href }, state: hashOf(bytes) });
+  if (!file.href.startsWith(base.href)) throw new Error(`vitecache: ${url} lies outside publicDir`);
+  return file.href;
+}
+
+/**
+ * The URL to fetch a public file at: for a root-absolute path, a `data:` URL of its publicFile(), since Node fetches no
+ * `file:` URLs. It holds the whole file, so a file must fit in memory as a string. The file becomes an input of the
+ * load the plugin is warming. Any other URL is returned unchanged.
+ */
+export function publicURL(url: string): string {
+  const file = publicFile(url);
+  if (file === url) return url;
+  const bytes = readFileSync(new URL(file));
+  globalThis.vitecache?.warming.getStore()?.files.push({ dependency: { path: file }, state: hashOf(bytes) });
   return `data:application/octet-stream;base64,${bytes.toString('base64')}`;
 }
 
@@ -59,11 +68,15 @@ export class CacheEntry {
     return { path: relative(this.#root, fileURLToPath(input.path)).split(sep).join('/') };
   }
 
-  /** The saved bytes while every input they were built from is unchanged, otherwise undefined. */
+  /**
+   * The saved bytes while every input they were built from is unchanged, otherwise undefined. While the plugin warms
+   * the load, also undefined for an entry saved without the plugin, which records only the declared inputs.
+   */
   async load(): Promise<Uint8Array | undefined> {
     globalThis.vitecache?.loaded.add(this.#key);
     this.#loaded = await record(this.#root, this.#inputs);
-    if (!(await current(this.#root, this.#directory, this.#key))) return undefined;
+    const warming = globalThis.vitecache?.warming.getStore() !== undefined;
+    if (!(await current(this.#root, this.#directory, this.#key, warming))) return undefined;
     return read(join(this.#directory, `${this.#key}.bin`));
   }
 
@@ -98,6 +111,7 @@ export class CacheEntry {
       join(this.#directory, `${this.#key}.bin`),
       Buffer.from(value.buffer, value.byteOffset, value.byteLength),
     );
-    await writeFileAtomic(join(this.#directory, `${this.#key}.json`), JSON.stringify({ inputs }));
+    const metadata = { inputs, warmed: warming !== undefined };
+    await writeFileAtomic(join(this.#directory, `${this.#key}.json`), JSON.stringify(metadata));
   }
 }

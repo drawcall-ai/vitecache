@@ -416,7 +416,7 @@ export function vitecache(): Plugin[] {
           const name = new URL(request.url, 'http://vitecache').pathname.slice(prefix.length);
           const key = /^([a-f0-9]{64})\.bin$/.exec(name)?.[1];
           if (!key) return next();
-          void current(config.root, directory, key)
+          void current(config.root, directory, key, false)
             .then((fresh) => (fresh ? undefined : idle()))
             .then(() => read(join(directory, name)))
             .then((bytes) => {
